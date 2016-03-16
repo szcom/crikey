@@ -29,7 +29,7 @@ if __name__ == "__main__":
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
     minibatch_size = 5
-    n_epochs = 100  # Used way at the bottom in the training loop!
+    n_epochs = 200  # Used way at the bottom in the training loop!
     # Was 300
     cut_len = 10  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)

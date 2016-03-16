@@ -6,9 +6,11 @@ from numpy.lib.stride_tricks import as_strided
 from scipy import linalg, fftpack
 from scipy.cluster.vq import vq
 from scipy.io import wavfile
+import scipy.signal as sg
 import tarfile
 import os
 import re
+import copy
 from collections import Counter
 import sys
 import pickle
@@ -103,6 +105,17 @@ def fetch_sample_speech_fruit(n_samples=None):
         d = d.astype('float32') / (2 ** 15)
         speech.append(d)
     return fs, speech, wav_names
+
+
+def fetch_sample_speech_tapestry():
+    url = "https://www.dropbox.com/s/qte66a7haqspq2g/tapestry.wav?dl=1"
+    wav_path = "tapestry.wav"
+    if not os.path.exists(wav_path):
+        download(url, wav_path)
+    fs, d = wavfile.read(wav_path)
+    d = d.astype('float32') / (2 ** 15)
+    # file is stereo? - just choose one channel
+    return fs, d
 
 
 def complex_to_real_view(arr_c):
@@ -362,7 +375,7 @@ def mel_freq_weights(n_fft, fs, n_filts=None, width=None):
     fft_freqs = np.arange(n_fft // 2) / n_fft * fs
     min_mel = herz_to_mel(min_freq)
     max_mel = herz_to_mel(max_freq)
-    partial = np.arange(n_filts + 2) / (n_filts + 1) * (max_mel - min_mel)
+    partial = np.arange(n_filts + 2) / (n_filts + 1.) * (max_mel - min_mel)
     bin_freqs = mel_to_herz(min_mel + partial)
     bin_bin = np.round(bin_freqs / fs * (n_fft - 1))
     for i in range(n_filts):
@@ -455,6 +468,436 @@ def angle_to_sin_cos(arr_angle):
 
 def sin_cos_to_angle(arr_sin, arr_cos):
     return np.arctan2(arr_sin, arr_cos)
+
+
+def xcorr_offset(x1, x2):
+    """
+    Under MSR-LA License
+
+    Based on MATLAB implementation from Spectrogram Inversion Toolbox
+
+    References
+    ----------
+    D. Griffin and J. Lim. Signal estimation from modified
+    short-time Fourier transform. IEEE Trans. Acoust. Speech
+    Signal Process., 32(2):236-243, 1984.
+
+    Malcolm Slaney, Daniel Naar and Richard F. Lyon. Auditory
+    Model Inversion for Sound Separation. Proc. IEEE-ICASSP,
+    Adelaide, 1994, II.77-80.
+
+    Xinglei Zhu, G. Beauregard, L. Wyse. Real-Time Signal
+    Estimation from Modified Short-Time Fourier Transform
+    Magnitude Spectra. IEEE Transactions on Audio Speech and
+    Language Processing, 08/2007.
+    """
+    x1 = x1 - x1.mean()
+    x2 = x2 - x2.mean()
+    frame_size = len(x2)
+    half = frame_size // 2
+    corrs = np.convolve(x1.astype('float32'), x2[::-1].astype('float32'))
+    corrs[:half] = -1E30
+    corrs[-half:] = -1E30
+    offset = corrs.argmax() - len(x1)
+    return offset
+
+
+def invert_spectrogram(X_s, step, calculate_offset=True, set_zero_phase=True):
+    """
+    Under MSR-LA License
+
+    Based on MATLAB implementation from Spectrogram Inversion Toolbox
+
+    References
+    ----------
+    D. Griffin and J. Lim. Signal estimation from modified
+    short-time Fourier transform. IEEE Trans. Acoust. Speech
+    Signal Process., 32(2):236-243, 1984.
+
+    Malcolm Slaney, Daniel Naar and Richard F. Lyon. Auditory
+    Model Inversion for Sound Separation. Proc. IEEE-ICASSP,
+    Adelaide, 1994, II.77-80.
+
+    Xinglei Zhu, G. Beauregard, L. Wyse. Real-Time Signal
+    Estimation from Modified Short-Time Fourier Transform
+    Magnitude Spectra. IEEE Transactions on Audio Speech and
+    Language Processing, 08/2007.
+    """
+    size = int(X_s.shape[1] // 2)
+    wave = np.zeros((X_s.shape[0] * step + size))
+    # Getting overflow warnings with 32 bit...
+    wave = wave.astype('float64')
+    total_windowing_sum = np.zeros((X_s.shape[0] * step + size))
+    win = 0.54 - .46 * np.cos(2 * np.pi * np.arange(size) / (size - 1))
+
+    est_start = int(size // 2) - 1
+    est_end = est_start + size
+    for i in range(X_s.shape[0]):
+        wave_start = int(step * i)
+        wave_end = wave_start + size
+        if set_zero_phase:
+            spectral_slice = X_s[i].real + 0j
+        else:
+            # already complex
+            spectral_slice = X_s[i]
+
+        # Don't need fftshift due to different impl.
+        wave_est = np.real(np.fft.ifft(spectral_slice))[::-1]
+        if calculate_offset and i > 0:
+            offset_size = size - step
+            if offset_size <= 0:
+                print("WARNING: Large step size >50\% detected! "
+                      "This code works best with high overlap - try "
+                      "with 75% or greater")
+                offset_size = step
+            offset = xcorr_offset(wave[wave_start:wave_start + offset_size],
+                                  wave_est[est_start:est_start + offset_size])
+        else:
+            offset = 0
+        wave[wave_start:wave_end] += win * wave_est[
+            est_start - offset:est_end - offset]
+        total_windowing_sum[wave_start:wave_end] += win
+    wave = np.real(wave) / (total_windowing_sum + 1E-6)
+    return wave
+
+
+def iterate_invert_spectrogram(X_s, fftsize, step, n_iter=10, verbose=False,
+                               complex_input=False):
+    """
+    Under MSR-LA License
+
+    Based on MATLAB implementation from Spectrogram Inversion Toolbox
+
+    References
+    ----------
+    D. Griffin and J. Lim. Signal estimation from modified
+    short-time Fourier transform. IEEE Trans. Acoust. Speech
+    Signal Process., 32(2):236-243, 1984.
+
+    Malcolm Slaney, Daniel Naar and Richard F. Lyon. Auditory
+    Model Inversion for Sound Separation. Proc. IEEE-ICASSP,
+    Adelaide, 1994, II.77-80.
+
+    Xinglei Zhu, G. Beauregard, L. Wyse. Real-Time Signal
+    Estimation from Modified Short-Time Fourier Transform
+    Magnitude Spectra. IEEE Transactions on Audio Speech and
+    Language Processing, 08/2007.
+    """
+    reg = np.max(X_s) / 1E8
+    X_best = copy.deepcopy(X_s)
+    for i in range(n_iter):
+        if verbose:
+            print("Runnning iter %i" % i)
+        if i == 0 and not complex_input:
+            X_t = invert_spectrogram(X_best, step, calculate_offset=True,
+                                     set_zero_phase=True)
+        else:
+            # Calculate offset was False in the MATLAB version
+            # but in mine it massively improves the result
+            # Possible bug in my impl?
+            X_t = invert_spectrogram(X_best, step, calculate_offset=True,
+                                     set_zero_phase=False)
+        est = stft(X_t, fftsize=fftsize, step=step, compute_onesided=False)
+        phase = est / np.maximum(reg, np.abs(est))
+        X_best = X_s * phase[:len(X_s)]
+    X_t = invert_spectrogram(X_best, step, calculate_offset=True,
+                             set_zero_phase=False)
+    return np.real(X_t)
+
+
+def voiced_unvoiced(X, window_size=256, window_step=128, copy=True):
+    """
+    Voiced unvoiced detection from a raw signal
+
+    Based on code from:
+        https://www.clear.rice.edu/elec532/PROJECTS96/lpc/code.html
+
+    Other references:
+        http://www.seas.ucla.edu/spapl/code/harmfreq_MOLRT_VAD.m
+
+    Parameters
+    ----------
+    X : ndarray
+        Raw input signal
+
+    window_size : int, optional (default=256)
+        The window size to use, in samples.
+
+    window_step : int, optional (default=128)
+        How far the window steps after each calculation, in samples.
+
+    copy : bool, optional (default=True)
+        Whether to make a copy of the input array or allow in place changes.
+    """
+    X = np.array(X, copy=copy)
+    if len(X.shape) < 2:
+        X = X[None]
+    n_points = X.shape[1]
+    n_windows = n_points // window_step
+    # Padding
+    pad_sizes = [(window_size - window_step) // 2,
+                 window_size - window_step // 2]
+    # TODO: Handling for odd window sizes / steps
+    X = np.hstack((np.zeros((X.shape[0], pad_sizes[0])), X,
+                   np.zeros((X.shape[0], pad_sizes[1]))))
+
+    clipping_factor = 0.6
+    b, a = sg.butter(10, np.pi * 9 / 40)
+    voiced_unvoiced = np.zeros((n_windows, 1))
+    period = np.zeros((n_windows, 1))
+    for window in range(max(n_windows - 1, 1)):
+        XX = X.ravel()[window * window_step + np.arange(window_size)]
+        XX *= sg.hamming(len(XX))
+        XX = sg.lfilter(b, a, XX)
+        left_max = np.max(np.abs(XX[:len(XX) // 3]))
+        right_max = np.max(np.abs(XX[-len(XX) // 3:]))
+        clip_value = clipping_factor * np.min([left_max, right_max])
+        XX_clip = np.clip(XX, clip_value, -clip_value)
+        XX_corr = np.correlate(XX_clip, XX_clip, mode='full')
+        center = np.argmax(XX_corr)
+        right_XX_corr = XX_corr[center:]
+        prev_window = max([window - 1, 0])
+        if voiced_unvoiced[prev_window] > 0:
+            # Want it to be harder to turn off than turn on
+            strength_factor = .29
+        else:
+            strength_factor = .3
+        start = np.where(right_XX_corr < .3 * XX_corr[center])[0]
+        # 20 is hardcoded but should depend on samplerate?
+        start = np.max([20, start[0]])
+        search_corr = right_XX_corr[start:]
+        index = np.argmax(search_corr)
+        second_max = search_corr[index]
+        if (second_max > strength_factor * XX_corr[center]):
+            voiced_unvoiced[window] = 1
+            period[window] = start + index - 1
+        else:
+            voiced_unvoiced[window] = 0
+            period[window] = 0
+    return np.array(voiced_unvoiced), np.array(period)
+
+
+def lpc_analysis(X, order=8, window_step=128, window_size=2 * 128,
+                 emphasis=0.9, voiced_start_threshold=.9,
+                 voiced_stop_threshold=.6, truncate=False, copy=True):
+    """
+    Extract LPC coefficients from a signal
+
+    Based on code from:
+        http://labrosa.ee.columbia.edu/matlab/sws/
+
+    _rParameters
+    ----------
+    X : ndarray
+        Signals to extract LPC coefficients from
+
+    order : int, optional (default=8)
+        Order of the LPC coefficients. For speech, use the general rule that the
+        order is two times the expected number of formants plus 2.
+        This can be formulated as 2 + 2 * (fs // 2000). For approx. signals
+        with fs = 7000, this is 8 coefficients - 2 + 2 * (7000 // 2000).
+
+    window_step : int, optional (default=128)
+        The size (in samples) of the space between each window
+
+    window_size : int, optional (default=2 * 128)
+        The size of each window (in samples) to extract coefficients over
+
+    emphasis : float, optional (default=0.9)
+        The emphasis coefficient to use for filtering
+
+    voiced_start_threshold : float, optional (default=0.9)
+        Upper power threshold for estimating when speech has started
+
+    voiced_stop_threshold : float, optional (default=0.6)
+        Lower power threshold for estimating when speech has stopped
+
+    truncate : bool, optional (default=False)
+        Whether to cut the data at the last window or do zero padding.
+
+    copy : bool, optional (default=True)
+        Whether to copy the input X or modify in place
+
+    Returns
+    -------
+    lp_coefficients : ndarray
+        lp coefficients to describe the frame
+
+    per_frame_gain : ndarray
+        calculated gain for each frame
+
+    residual_excitation : ndarray
+        leftover energy which is not described by lp coefficents and gain
+
+    voiced_frames : ndarray
+        array of [0, 1] values which holds voiced/unvoiced decision for each
+        frame.
+
+    References
+    ----------
+    D. P. W. Ellis (2004), "Sinewave Speech Analysis/Synthesis in Matlab",
+    Web resource, available: http://www.ee.columbia.edu/ln/labrosa/matlab/sws/
+    """
+    X = np.array(X, copy=copy)
+    if len(X.shape) < 2:
+        X = X[None]
+
+    n_points = X.shape[1]
+    n_windows = n_points // window_step
+    if not truncate:
+        pad_sizes = [(window_size - window_step) // 2,
+                     window_size - window_step // 2]
+        # TODO: Handling for odd window sizes / steps
+        X = np.hstack((np.zeros((X.shape[0], pad_sizes[0])), X,
+                       np.zeros((X.shape[0], pad_sizes[1]))))
+    else:
+        pad_sizes = [0, 0]
+        X = X[0, :n_windows * window_step]
+
+    lp_coefficients = np.zeros((n_windows, order + 1))
+    per_frame_gain = np.zeros((n_windows, 1))
+    residual_excitation = np.zeros(
+        ((n_windows - 1) * window_step + window_size))
+    # Pre-emphasis high-pass filter
+    X = sg.lfilter([1, -emphasis], 1, X)
+    # stride_tricks.as_strided?
+    autocorr_X = np.zeros((n_windows, 2 * window_size - 1))
+    for window in range(max(n_windows - 1, 1)):
+        XX = X.ravel()[window * window_step + np.arange(window_size)]
+        WXX = XX * sg.hanning(window_size)
+        autocorr_X[window] = np.correlate(WXX, WXX, mode='full')
+        center = np.argmax(autocorr_X[window])
+        RXX = autocorr_X[window,
+                         np.arange(center, window_size + order)]
+        R = linalg.toeplitz(RXX[:-1])
+        solved_R = linalg.pinv(R).dot(RXX[1:])
+        filter_coefs = np.hstack((1, -solved_R))
+        residual_signal = sg.lfilter(filter_coefs, 1, WXX)
+        gain = np.sqrt(np.mean(residual_signal ** 2))
+        lp_coefficients[window] = filter_coefs
+        per_frame_gain[window] = gain
+        assign_range = window * window_step + np.arange(window_size)
+        residual_excitation[assign_range] += residual_signal / gain
+    # Throw away first part in overlap mode for proper synthesis
+    residual_excitation = residual_excitation[pad_sizes[0]:]
+    return lp_coefficients, per_frame_gain, residual_excitation
+
+
+def lpc_synthesis(lp_coefficients, per_frame_gain, residual_excitation=None,
+                  voiced_frames=None, window_step=128, emphasis=0.9):
+    """
+    Synthesize a signal from LPC coefficients
+
+    Based on code from:
+        http://labrosa.ee.columbia.edu/matlab/sws/
+        http://web.uvic.ca/~tyoon/resource/auditorytoolbox/auditorytoolbox/synlpc.html
+
+    Parameters
+    ----------
+    lp_coefficients : ndarray
+        Linear prediction coefficients
+
+    per_frame_gain : ndarray
+        Gain coefficients
+
+    residual_excitation : ndarray or None, optional (default=None)
+        Residual excitations. If None, this will be synthesized with white noise
+
+    voiced_frames : ndarray or None, optional (default=None)
+        Voiced frames. If None, all frames assumed to be voiced.
+
+    window_step : int, optional (default=128)
+        The size (in samples) of the space between each window
+
+    emphasis : float, optional (default=0.9)
+        The emphasis coefficient to use for filtering
+
+    overlap_add : bool, optional (default=True)
+        What type of processing to use when joining windows
+
+    copy : bool, optional (default=True)
+       Whether to copy the input X or modify in place
+
+    Returns
+    -------
+    synthesized : ndarray
+        Sound vector synthesized from input arguments
+
+    References
+    ----------
+    D. P. W. Ellis (2004), "Sinewave Speech Analysis/Synthesis in Matlab",
+    Web resource, available: http://www.ee.columbia.edu/ln/labrosa/matlab/sws/
+    """
+    # TODO: Incorporate better synthesis from
+    # http://eecs.oregonstate.edu/education/docs/ece352/CompleteManual.pdf
+    window_size = 2 * window_step
+    [n_windows, order] = lp_coefficients.shape
+
+    n_points = (n_windows + 1) * window_step
+    n_excitation_points = n_points + window_step + window_step // 2
+
+    random_state = np.random.RandomState(1999)
+    if residual_excitation is None:
+        # Need to generate excitation
+        if voiced_frames is None:
+            # No voiced/unvoiced info, so just use randn
+            voiced_frames = np.ones((lp_coefficients.shape[0], 1))
+        residual_excitation = np.zeros((n_excitation_points))
+        f, m = lpc_to_frequency(lp_coefficients, per_frame_gain)
+        t = np.linspace(0, 1, window_size, endpoint=False)
+        hanning = sg.hanning(window_size)
+        for window in range(n_windows):
+            window_base = window * window_step
+            index = window_base + np.arange(window_size)
+            if voiced_frames[window]:
+                sig = np.zeros_like(t)
+                cycles = np.cumsum(f[window][0] * t)
+                sig += sg.sawtooth(cycles, 0.001)
+                residual_excitation[index] += hanning * sig
+            residual_excitation[index] += hanning * 0.01 * random_state.randn(
+                window_size)
+    else:
+        n_excitation_points = residual_excitation.shape[0]
+        n_points = n_excitation_points + window_step + window_step // 2
+    residual_excitation = np.hstack((residual_excitation,
+                                     np.zeros(window_size)))
+    if voiced_frames is None:
+        voiced_frames = np.ones_like(per_frame_gain)
+
+    synthesized = np.zeros((n_points))
+    for window in range(n_windows):
+        window_base = window * window_step
+        oldbit = synthesized[window_base + np.arange(window_step)]
+        w_coefs = lp_coefficients[window]
+        if not np.all(w_coefs):
+            # Hack to make lfilter avoid
+            # ValueError: BUG: filter coefficient a[0] == 0 not supported yet
+            # when all coeffs are 0
+            w_coefs = [1]
+        g_coefs = voiced_frames[window] * per_frame_gain[window]
+        index = window_base + np.arange(window_size)
+        newbit = g_coefs * sg.lfilter([1], w_coefs,
+                                      residual_excitation[index])
+        synthesized[index] = np.hstack((oldbit, np.zeros(
+            (window_size - window_step))))
+        synthesized[index] += sg.hanning(window_size) * newbit
+    synthesized = sg.lfilter([1], [1, -emphasis], synthesized)
+    return synthesized
+
+
+def run_lpc_example():
+    fs, X = fetch_sample_speech_tapestry()
+    window_size = 256
+    window_step = 128
+    a, g, e = lpc_analysis(X, order=8, window_step=window_step,
+                           window_size=window_size, emphasis=0.9,
+                           copy=True)
+    v, p = voiced_unvoiced(X, window_size=window_size,
+                           window_step=window_step)
+    X_r = lpc_synthesis(a, g, e, voiced_frames=v,
+                        emphasis=0.9, window_step=window_step)
+    wavfile.write("lpc_orig.wav", fs, soundsc(X))
+    wavfile.write("lpc_rec.wav", fs, soundsc(X_r))
 
 
 def run_fft_dct_example():
@@ -678,72 +1121,101 @@ def fetch_fruitspeech_nonpar():
     all_chars = [c for c in sorted(list(set("".join(classes))))]
     char2code = {v: k for k, v in enumerate(all_chars)}
     vocabulary_size = len(char2code.keys())
-    y = []
+    y =[]
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
-    n_dct = 64
-    time_smoothing = 3
-    def _pre(list_of_data):
-        f_r = np.vstack([mdct_slow(dd, n_dct) for dd in list_of_data])
-        if len(f_r) % time_smoothing != 0:
-            newlen = len(f_r) - len(f_r) % time_smoothing
-            f_r = f_r[:newlen]
-        f_r = f_r.reshape((len(f_r) // time_smoothing,
-                           time_smoothing * f_r.shape[1]))
-        return f_r, n_dct
+    # 256 @ 8khz
+    ws = 2 ** int(np.log(0.032 * fs) / np.log(2))
+    window_size = ws
+    window_step = window_size // 2
+    lpc_order = 30
+    def _pre(x):
+        a, g, e = lpc_analysis(x, order=lpc_order, window_step=window_step,
+                               window_size=window_size, emphasis=0.9,
+                               copy=True)
+        v, p = voiced_unvoiced(x, window_size=window_size,
+                               window_step=window_step)
+        first_dim = e.shape[0] // len(a)
+        cut_len = e.shape[0] - e.shape[0] % len(a)
+        e = e[:cut_len]
+        e = e.reshape((len(a), -1))
+        f_sub = a[:, 1:]
+        f_full = np.hstack((a, g, v, e))
+        return f_sub, f_full
 
     def _train(list_of_data):
-        f_r, n_dct = _pre(list_of_data)
-        clusters = f_r
-        return clusters
+        f_sub = None
+        f_full = None
+        for i in range(len(list_of_data)):
+            f_sub_i, f_full_i = _pre(list_of_data[i])
+            if f_sub is None:
+                f_sub = f_sub_i
+                f_full = f_full_i
+            else:
+                f_sub = np.vstack((f_sub, f_sub_i))
+                if f_full.shape[1] > f_full_i.shape[1]:
+                    f_full_i = np.hstack(
+                        (f_full_i, np.zeros_like(f_full_i[:, -1][:, None])))
+                elif f_full_i.shape[1] > f_full.shape[1]:
+                    f_full_i = f_full_i[:, :f_full.shape[1]]
+                f_full = np.vstack((f_full, f_full_i))
+        sub_clusters = f_sub
+        full_clusters = f_full
+        return sub_clusters, full_clusters
 
-    def _re(x, clusters):
+    def _clust(x, sub_clusters):
+        f_sub, f_full = _pre(x)
+        f_clust = f_sub
+        mem, _ = vq(copy.deepcopy(f_clust), copy.deepcopy(sub_clusters))
+        # scipy vq sometimes puts out garbage? choose one at random...
+        #mem[np.abs(mem) >= len(mel_clusters)] = mem[
+        #    np.abs(mem) >= len(mel_clusters)] % len(mel_clusters)
+        return mem
+
+    def _re(x, sub_clusters, full_clusters):
         memberships = x
-        vq_r = clusters[memberships]
-        vq_r = vq_r.reshape((time_smoothing * len(vq_r),
-                             vq_r.shape[1] // time_smoothing))
-        d_k = imdct_slow(vq_r, n_dct)
-        return d_k, memberships
-
-    def _app(list_of_data, clusters):
-        f_r, n_dct = _pre(list_of_data)
-        f_clust = f_r
-        mem, _ = vq(f_clust, clusters)
-        d_k, memberships = _re(mem, clusters)
-        return d_k, memberships
-
+        vq_x = full_clusters[memberships]
+        a = vq_x[:, :lpc_order + 1]
+        offset = lpc_order + 1
+        g = vq_x[:, offset:offset + 1]
+        offset = offset + 1
+        v = vq_x[:, offset:offset + 1]
+        offset = offset + 1
+        e = vq_x[:, offset:].ravel()
+        x_r = lpc_synthesis(a, g, e, voiced_frames=v,
+                            emphasis=0.9, window_step=window_step)
+        agc_x_r, _, _ = time_attack_agc(x_r, fs)
+        return x_r
 
     random_state = np.random.RandomState(1999)
     all_ind = list(range(8))
     # Get 5 random subsets
     random_state.shuffle(all_ind)
-    ind = all_ind[:1]
+    ind = all_ind[:6]
 
     d1 = []
     for i in ind:
         d1 += d[i::8]
 
-    clusters = _train(d1)
+    sub_clusters, full_clusters = _train(d1)
 
     def _re_wrap(x):
         x = x.argmax(axis=-1)
-        re_d, _ = _re(x, clusters)
+        re_d = _re(x, sub_clusters, full_clusters)
         return re_d
 
     def _apply(x):
-        list_of_data = [x]
-        _, m = _app(list_of_data, clusters)
+        m = _clust(x, sub_clusters)
         return m
 
     X = [_apply(Xi) for Xi in d]
-    X = [dense_to_one_hot(Xi, len(clusters)) for Xi in X]
+    X = [dense_to_one_hot(Xi, len(sub_clusters)) for Xi in X]
 
     """
-    d2 = d[all_ind[-1]::8]
-    for i in range(len(d2)):
-        di = _re_wrap(d2[i])
-        wavfile.write("t_%i.wav" % i, fs, soundsc(di))
+    for n, Xi in enumerate(X[all_ind[-1]::8]):
+        di = _re_wrap(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
     raise ValueError()
     """
 
@@ -1214,4 +1686,5 @@ def load_checkpoint(saved_checkpoint_path):
 
 
 if __name__ == "__main__":
-    run_fft_dct_example()
+    #run_fft_dct_example()
+    run_lpc_example()
