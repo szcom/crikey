@@ -227,6 +227,53 @@ def invert_halfoverlap(X_strided):
     return X
 
 
+def overlap_add(X_strided, window_step, wsola=False):
+    """
+    overlap add to reconstruct X
+
+    Parameters
+    ----------
+    X_strided : ndarray, shape=(n_windows, window_size)
+        X as overlapped windows
+
+    window_step : int
+       step size for overlap add
+
+    Returns
+    -------
+    X : ndarray, shape=(n_samples,)
+        Reconstructed version of X
+    """
+    # Hardcoded 50% overlap! Can generalize later...
+    n_rows, window_size = X_strided.shape
+
+    # Start with largest size (no overlap) then truncate after we finish
+    # +2 for one window on each side
+    X = np.zeros(((n_rows + 2) * window_size,)).astype(X_strided.dtype)
+    start_index = 0
+
+    total_windowing_sum = np.zeros((X.shape[0]))
+    win = 0.54 - .46 * np.cos(2 * np.pi * np.arange(window_size) / (
+        window_size - 1))
+    for i in range(n_rows):
+        end_index = start_index + window_size
+        if wsola:
+            offset_size = window_size - window_step
+            offset = xcorr_offset(X[start_index:start_index + offset_size],
+                                  X_strided[i, :offset_size])
+            X[start_index - offset:end_index - offset] += X_strided[i]
+            total_windowing_sum[start_index - offset:end_index - offset] += win
+            start_index = start_index + window_step
+        else:
+            X[start_index:end_index] += X_strided[i]
+            total_windowing_sum[start_index:end_index] += win
+            start_index += window_step
+    # Not currently using windows or window norm
+    #X = np.real(X) / (total_windowing_sum + 1)
+    X = X[:end_index]
+    return X
+
+
 def stft(X, fftsize=128, step="half", mean_normalize=True, real=False,
          compute_onesided=True):
     """
@@ -664,7 +711,10 @@ def voiced_unvoiced(X, window_size=256, window_step=128, copy=True):
             strength_factor = .3
         start = np.where(right_XX_corr < .3 * XX_corr[center])[0]
         # 20 is hardcoded but should depend on samplerate?
-        start = np.max([20, start[0]])
+        try:
+            start = np.max([20, start[0]])
+        except IndexError:
+            start = 20
         search_corr = right_XX_corr[start:]
         index = np.argmax(search_corr)
         second_max = search_corr[index]
@@ -1078,29 +1128,46 @@ def fetch_fruitspeech():
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
+    n_fft = 128
     def _pre(x):
-        n_fft = 128
         X_stft = stft(x, n_fft)
-        X_rr = complex_to_real_view(X_stft).ravel()
-        X_dct = mdct_slow(X_rr, n_fft)
-        return X_dct
+        X_mag = complex_to_abs(X_stft)
+        X_phase = complex_to_angle(X_stft)
+        X_mag_phase = np.hstack((X_mag, X_phase))
+        return X_mag_phase
 
     X = [_pre(di) for di in d]
     X_len = np.sum([len(Xi) for Xi in X])
     X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
     X_mean = X_sum / X_len
-    #X = [Xi - X_mean[None] for Xi in X]
+    X = [Xi - X_mean[None] for Xi in X]
+    X_max = max([np.max(Xi) for Xi in X])
+    X_min = min([np.min(Xi) for Xi in X])
+
+    def range_scale(x):
+        return (x - X_min) / (X_max - X_min)
+
+    def range_unscale(x):
+        return x * (X_max - X_min) + X_min
+
+    X = [range_scale(Xi) for Xi in X]
 
     def _re(x):
-        n_fft = 128
-        X_dct = x # + X_mean
-        X_idct = imdct_slow(X_dct, n_fft).reshape(-1, n_fft)
-        X_irr = real_to_complex_view(X_idct)
-        X_r = istft(X_irr, n_fft)
+        X_mag_phase = range_unscale(x)
+        X_mag_phase = X_mag_phase + X_mean
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_phase = X_mag_phase[:, n_fft // 2:]
+        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
+        X_r = istft(X_stft, n_fft)
         return X_r
 
-    # X_r = [_re(Xi) for Xi in X]
-    # 20 * np.log10(linalg.norm(X_r[0][:len(d[0])] - d[0]) / linalg.norm(d[0]))
+    """
+    for n, Xi in enumerate(X[::8]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
 
     speech = {}
     speech["vocabulary_size"] = vocabulary_size
@@ -1121,26 +1188,29 @@ def fetch_fruitspeech_nonpar():
     all_chars = [c for c in sorted(list(set("".join(classes))))]
     char2code = {v: k for k, v in enumerate(all_chars)}
     vocabulary_size = len(char2code.keys())
-    y =[]
+    y = []
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
-    # 256 @ 8khz
+    # 256 @ 8khz - .032
     ws = 2 ** int(np.log(0.032 * fs) / np.log(2))
     window_size = ws
-    window_step = window_size // 2
+    # 63% overlap
+    window_step = window_size // 4 + window_size // 8
     lpc_order = 30
     def _pre(x):
         a, g, e = lpc_analysis(x, order=lpc_order, window_step=window_step,
                                window_size=window_size, emphasis=0.9,
                                copy=True)
+        f_sub = a[:, 1:]
+        """
+        f_full = stft(x, window_size, window_step, compute_onesided=False)
+        """
         v, p = voiced_unvoiced(x, window_size=window_size,
                                window_step=window_step)
-        first_dim = e.shape[0] // len(a)
         cut_len = e.shape[0] - e.shape[0] % len(a)
         e = e[:cut_len]
         e = e.reshape((len(a), -1))
-        f_sub = a[:, 1:]
         f_full = np.hstack((a, g, v, e))
         return f_sub, f_full
 
@@ -1169,6 +1239,7 @@ def fetch_fruitspeech_nonpar():
         f_clust = f_sub
         mem, _ = vq(copy.deepcopy(f_clust), copy.deepcopy(sub_clusters))
         # scipy vq sometimes puts out garbage? choose one at random...
+        # possibly related to NaN in input
         #mem[np.abs(mem) >= len(mel_clusters)] = mem[
         #    np.abs(mem) >= len(mel_clusters)] % len(mel_clusters)
         return mem
@@ -1176,6 +1247,21 @@ def fetch_fruitspeech_nonpar():
     def _re(x, sub_clusters, full_clusters):
         memberships = x
         vq_x = full_clusters[memberships]
+        """
+        # STFT frames not working well in rec
+        x_r = iterate_invert_spectrogram(vq_x, window_size, window_step,
+                                         n_iter=50, complex_input=True)
+        """
+        """
+        X = vq_x
+        x_r = istft(X, window_size)
+        X_pad = np.zeros((X.shape[0], 2 * X.shape[1])) + 0j
+        X_pad[:, :window_size // 2] = X
+        X_pad[:, window_size // 2:] = 0
+        X = X_pad
+        ts_x = fftpack.ifft(X)
+        x_r = overlap_add(ts_x, window_step, wsola=True)
+        """
         a = vq_x[:, :lpc_order + 1]
         offset = lpc_order + 1
         g = vq_x[:, offset:offset + 1]
@@ -1185,8 +1271,11 @@ def fetch_fruitspeech_nonpar():
         e = vq_x[:, offset:].ravel()
         x_r = lpc_synthesis(a, g, e, voiced_frames=v,
                             emphasis=0.9, window_step=window_step)
-        agc_x_r, _, _ = time_attack_agc(x_r, fs)
-        return x_r
+        try:
+            agc_x_r, _, _ = time_attack_agc(x_r, fs)
+        except:
+            agc_x_r = x_r
+        return agc_x_r
 
     random_state = np.random.RandomState(1999)
     all_ind = list(range(8))
@@ -1211,11 +1300,15 @@ def fetch_fruitspeech_nonpar():
 
     X = [_apply(Xi) for Xi in d]
     X = [dense_to_one_hot(Xi, len(sub_clusters)) for Xi in X]
-
     """
-    for n, Xi in enumerate(X[all_ind[-1]::8]):
+    for n, Xi in enumerate(X[all_ind[0]::8]):
         di = _re_wrap(Xi)
         wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    for n, Xi in enumerate(X[all_ind[-1]::8]):
+        di = _re_wrap(Xi)
+        wavfile.write("to_%i.wav" % n, fs, soundsc(di))
+
     raise ValueError()
     """
 
@@ -1467,12 +1560,19 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
         raise AttributeError("Tensor dim not supported")
 
 
-def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5):
-    idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
-                        axis=1)
+def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5,
+                        debug=False):
+    if debug:
+        idx = tensor.argmax(coeff, axis=1)
+    else:
+        idx = tensor.argmax(
+            theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype), axis=1)
     mu = mu[tensor.arange(mu.shape[0]), :, idx]
     sigma = sigma[tensor.arange(sigma.shape[0]), :, idx]
-    z = theano_rng.normal(size=mu.shape, avg=0., std=1., dtype=mu.dtype)
+    if debug:
+        z = 0.
+    else:
+        z = theano_rng.normal(size=mu.shape, avg=0., std=1., dtype=mu.dtype)
     s = mu + sigma * z
     return s
 
@@ -1490,14 +1590,18 @@ def diagonal_gmm(true, mu, sigma, coeff, epsilon=1E-5):
     return nll
 
 
-def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5):
-    idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
-                        axis=1)
-    mu = mu[tensor.arange(mu.shape[0]), :, idx]
-    sigma = sigma[tensor.arange(sigma.shape[0]), :, idx]
-    z = theano_rng.normal(size=mu.shape, avg=0., std=1., dtype=mu.dtype)
-    s = mu + sigma * z
-    return s
+def diagonal_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
+    n_dim = true.ndim
+    shape_t = true.shape
+    true = true.reshape((-1, shape_t[-1]))
+    true = true.dimshuffle(0, 1, 'x')
+    inner0 = np.pi - abs(tensor.mod(true - mu, 2 * np.pi) - np.pi)
+    inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
+    inner += tensor.sqr(inner0 / sigma)
+    inner = -0.5 * tensor.sum(inner, axis=1)
+    nll = -logsumexp(tensor.log(coeff) + inner, axis=1)
+    nll = nll.reshape(shape_t[:-1], ndim=n_dim-1)
+    return nll
 
 
 def bernoulli_and_bivariate_gmm(true, mu, sigma, corr, coeff, binary,
@@ -1524,9 +1628,6 @@ def bernoulli_and_bivariate_gmm(true, mu, sigma, corr, coeff, binary,
 
     t1 = true[:, 1]
     t2 = true[:, 2]
-    theano.printing.Print("t1")(t1.shape)
-    theano.printing.Print("mu1")(mu_1.shape)
-    theano.printing.Print("sigma1")(sigma_1.shape)
     Z = (((t1 - mu_1)/sigma_1)**2) + (((t2 - mu_2) / sigma_2)**2)
     Z -= (2. * (corr * (t1 - mu_1)*(t2 - mu_2)) / (sigma_1 * sigma_2))
     inner2 = 0.5 * (1. / (1. - corr**2 + epsilon))

@@ -31,7 +31,7 @@ if __name__ == "__main__":
     minibatch_size = 5
     n_epochs = 200  # Used way at the bottom in the training loop!
     # Was 300
-    cut_len = 10  # Used way at the bottom in the training loop!
+    cut_len = 20  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=90,

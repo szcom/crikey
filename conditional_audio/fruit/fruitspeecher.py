@@ -10,7 +10,7 @@ from kdllib import fetch_fruitspeech, list_iterator, np_zeros, GRU, GRUFork
 from kdllib import make_weights, as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import save_checkpoint, save_weights, sample_diagonal_gmm
-from kdllib import diagonal_gmm, soundsc
+from kdllib import diagonal_gmm, diagonal_phase_gmm, soundsc
 
 
 if __name__ == "__main__":
@@ -27,9 +27,9 @@ if __name__ == "__main__":
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
     minibatch_size = 5
-    n_epochs = 1000  # Used way at the bottom in the training loop!
+    n_epochs = 200  # Used way at the bottom in the training loop!
     # Was 300
-    cut_len = 50  # Used way at the bottom in the training loop!
+    cut_len = 20  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=90,
@@ -46,7 +46,9 @@ if __name__ == "__main__":
     n_components = 3
     n_out = X_mb.shape[-1]
     n_chars = vocabulary_size
-    n_density = 2 * n_out * n_components + n_components
+    # mag and phase each n_out // 2
+    # one 2 for mu, sigma , + n_components for coeff
+    n_density = 2 * n_out // 2 * n_components + n_components
 
     desc = "Speech generation"
     parser = argparse.ArgumentParser(description=desc)
@@ -59,10 +61,11 @@ if __name__ == "__main__":
                         default=None,
                         required=False)
     parser.add_argument('-w', '--write',
-                        help='The string to write out (default first minibatch)',
+                        help='The string to use',
                         default=None,
                         required=False)
     # http://stackoverflow.com/questions/12116685/how-can-i-require-my-python-scripts-argument-to-be-a-float-between-0-0-1-0-usin
+
     def restricted_float(x):
         x = float(x)
         if x < 0.0:
@@ -128,9 +131,11 @@ if __name__ == "__main__":
                 oh = dense_to_one_hot(
                     np.array([vocabulary[c] for c in sample_string]),
                     vocabulary_size)
+                c_mb = np.zeros(
+                    (len(oh), minibatch_size, oh.shape[-1])).astype(c_mb.dtype)
                 c_mb[:len(oh), :, :] = oh[:, None, :]
                 c_mb = c_mb[:len(oh)]
-                c_mb_mask = c_mb_mask[:len(oh)]
+                c_mb_mask = np.ones_like(c_mb[:, :, 0])
 
             if args.sample_length is None:
                 # Automatic sampling stop as described in Graves' paper
@@ -182,12 +187,11 @@ if __name__ == "__main__":
                 ex = completed[i]
                 ex_str = "".join([rlookup[c]
                                   for c in np.argmax(cond[:, i], axis=1)])
-                s = "gen_%i.wav" % i
+                s = "gen_%s_%i.wav" % (ex_str, i)
                 ii = reconstruct(ex)
                 wavfile.write(s, fs, soundsc(ii))
-                #it = reconstruct(X[0])
-                #wavfile.write("orig.wav", fs, soundsc(it))
-                # plot_lines_iamondb_example(ex, title=ex_str, save_name=s)
+                it = reconstruct(X[0])
+                wavfile.write("orig.wav", fs, soundsc(it))
         valid_itr.reset()
         print("Sampling complete, exiting...")
         sys.exit()
@@ -253,12 +257,15 @@ if __name__ == "__main__":
 
     h1_to_att_a, h1_to_att_b, h1_to_att_k = make_weights(n_hid, 3 * [att_size],
                                                          random_state)
-    h1_to_outs, = make_weights(n_hid, [n_density], random_state)
-    h2_to_outs, = make_weights(n_hid, [n_density], random_state)
-    h3_to_outs, = make_weights(n_hid, [n_density], random_state)
+    # Need a , on single results since it always returns a list
+    h1_to_outs, = make_weights(n_hid, [n_hid], random_state)
+    h2_to_outs, = make_weights(n_hid, [n_hid], random_state)
+    h3_to_outs, = make_weights(n_hid, [n_hid], random_state)
+    # 2 * for mag and phase
+    outs_to_corr_outs, = make_weights(n_hid, [2 * n_density], random_state)
 
     params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
-    params += [h1_to_outs, h2_to_outs, h3_to_outs]
+    params += [h1_to_outs, h2_to_outs, h3_to_outs, outs_to_corr_outs]
 
     inpt = X_sym[:-1]
     target = X_sym[1:]
@@ -325,10 +332,12 @@ if __name__ == "__main__":
 
     def _slice_outs(outs):
         k = n_components
+        half = n_out // 2
         outs = outs.reshape((-1, n_density))
-        mu = outs[:, 0:n_out * k].reshape((-1, n_out, k))
-        sigma = outs[:, n_out * k:2 * n_out * k].reshape((-1, n_out, k))
-        coeff = outs[:, 2 * n_out * k:]
+        mu = outs[:, 0:half * k].reshape((-1, half, k))
+        sigma = outs[:, half * k:2 * half * k].reshape(
+            (-1, half, k))
+        coeff = outs[:, 2 * half * k:]
         sigma = tensor.exp(sigma - bias_sym) + 1E-6
         coeff = tensor.nnet.softmax(coeff * (1. + bias_sym)) + 1E-6
         return mu, sigma, coeff
@@ -378,14 +387,21 @@ if __name__ == "__main__":
                           h3_tm1)
         out_t = h1_t.dot(h1_to_outs) + h2_t.dot(h2_to_outs) + h3_t.dot(
             h3_to_outs)
-
-        mu, sigma, coeff = _slice_outs(out_t)
-        s = sample_diagonal_gmm(mu, sigma, coeff, srng)
-        x_t = s
+        corr_out_t = out_t.dot(outs_to_corr_outs)
+        split = corr_out_t.shape[-1] // 2
+        mag_out_t = corr_out_t[:, :split]
+        phase_out_t = corr_out_t[:, split:]
+        mu_mag, sigma_mag, coeff_mag = _slice_outs(mag_out_t)
+        mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_out_t)
+        s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng)
+        s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng)
+        s_phase = tensor.mod(s_phase, 2 * np.pi) - np.pi
+        x_t = tensor.concatenate([s_mag, s_phase], axis=-1)
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
 
     n_steps_sym = tensor.iscalar()
-    # Can't do test values with sampling?
+    n_steps_sym.tag.test_value = 10
+    # Set sample to debug in order to check test values
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h), supdates = theano.scan(
         fn=sample_step,
         n_steps=n_steps_sym,
@@ -393,7 +409,6 @@ if __name__ == "__main__":
         outputs_info=[init_x, init_h1, init_h2, init_h3,
                       init_kappa, init_w, None, None],
         non_sequences=[context])
-
 
     """
     # Testing step function
@@ -415,9 +430,40 @@ if __name__ == "__main__":
 
     outs = h1.dot(h1_to_outs) + h2.dot(h2_to_outs) + h3.dot(h3_to_outs)
 
-    mu, sigma, coeff = _slice_outs(outs)
+    """
+    # Keep this hackery in place for potential RNN? Would need to find the
+    # length programmatically or force to be the same always
+    outs = outs.dimshuffle(2, 1, 0)
 
-    cost = diagonal_gmm(target, mu, sigma, coeff)
+    def out_step(x_t, x_tm1):
+        return x_t
+
+    init_corr_outs = tensor.zeros((outs.shape[1], outs.shape[2]))
+    corr_outs, updates = theano.scan(
+        fn=out_step,
+        sequences=[outs],
+        outputs_info=[init_corr_outs])
+    corr_outs = corr_outs.dimshuffle(2, 1, 0)
+    """
+
+    corr_outs = outs.dot(outs_to_corr_outs)
+
+    split = corr_outs.shape[-1] // 2
+    mag_outs = corr_outs[:, :, :split]
+    phase_outs = corr_outs[:, :, split:]
+
+    mu_mag, sigma_mag, coeff_mag = _slice_outs(mag_outs)
+    mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_outs)
+
+    target_split = n_out // 2
+    mag_target = target[:, :, :target_split]
+    phase_target = target[:, :, target_split:]
+
+    mag_cost = diagonal_gmm(
+        mag_target, mu_mag, sigma_mag, coeff_mag)
+    phase_cost = diagonal_phase_gmm(
+        phase_target, mu_phase, sigma_phase, coeff_phase)
+    cost = mag_cost + phase_cost
 
     cost = cost * mask
     cost = cost.sum() / cut_len
@@ -441,7 +487,7 @@ if __name__ == "__main__":
     predict_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
                                         init_h1, init_h2, init_h3, init_kappa,
                                         init_w, bias_sym],
-                                       [mu, sigma, coeff],
+                                       [corr_outs],
                                        on_unused_input='warn')
     attention_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
                                           init_h1, init_h2, init_h3, init_kappa,
@@ -485,7 +531,6 @@ if __name__ == "__main__":
         except KeyError:
             print("Key not found - model structure may have changed.")
             print("Continuing anyways - statistics may not be correct!")
-
 
     def _loop(function, itr):
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
