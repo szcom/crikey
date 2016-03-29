@@ -26,15 +26,16 @@ if __name__ == "__main__":
     X = np.array([x.astype(theano.config.floatX) for x in X])
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
-    minibatch_size = 5
-    n_epochs = 200  # Used way at the bottom in the training loop!
+    minibatch_size = 20
+    n_epochs = 2000  # Used way at the bottom in the training loop!
+    checkpoint_every_n = 500
     # Was 300
-    cut_len = 20  # Used way at the bottom in the training loop!
+    cut_len = 40  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
-    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=90,
-                              make_mask=True)
-    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=90,
+    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
+                              randomize=True, make_mask=True)
+    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=80,
                               make_mask=True)
 
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
@@ -43,7 +44,7 @@ if __name__ == "__main__":
     input_dim = X_mb.shape[-1]
     n_hid = 400
     att_size = 10
-    n_components = 3
+    n_components = 20
     n_out = X_mb.shape[-1]
     n_chars = vocabulary_size
     # mag and phase each n_out // 2
@@ -190,8 +191,6 @@ if __name__ == "__main__":
                 s = "gen_%s_%i.wav" % (ex_str, i)
                 ii = reconstruct(ex)
                 wavfile.write(s, fs, soundsc(ii))
-                it = reconstruct(X[0])
-                wavfile.write("orig.wav", fs, soundsc(it))
         valid_itr.reset()
         print("Sampling complete, exiting...")
         sys.exit()
@@ -199,9 +198,9 @@ if __name__ == "__main__":
         print("No plotting arguments, starting training mode!")
 
     X_sym = tensor.tensor3("X_sym")
-    X_sym.tag.test_value = X_mb
+    X_sym.tag.test_value = X_mb[:cut_len]
     X_mask_sym = tensor.matrix("X_mask_sym")
-    X_mask_sym.tag.test_value = X_mb_mask
+    X_mask_sym.tag.test_value = X_mb_mask[:cut_len]
     c_sym = tensor.tensor3("c_sym")
     c_sym.tag.test_value = c_mb
     c_mask_sym = tensor.matrix("c_mask_sym")
@@ -395,7 +394,7 @@ if __name__ == "__main__":
         mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_out_t)
         s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng)
         s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng)
-        s_phase = tensor.mod(s_phase, 2 * np.pi) - np.pi
+        s_phase = tensor.mod(s_phase + np.pi, 2 * np.pi) - np.pi
         x_t = tensor.concatenate([s_mag, s_phase], axis=-1)
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
 
@@ -543,10 +542,17 @@ if __name__ == "__main__":
         for n in range(n_cuts):
             start = n * cut_len
             stop = (n + 1) * cut_len
-            if len(X_mb[start:stop]) < 1:
-                # edge case where there is only one sample left
-                # just ignore the last sample
-                break
+            if len(X_mb[start:stop]) < cut_len:
+                new_len = cut_len - len(X_mb) % cut_len
+                zeros = np.zeros((new_len, X_mb.shape[1],
+                                  X_mb.shape[2]))
+                zeros = zeros.astype(X_mb.dtype)
+                mask_zeros = np.zeros((new_len, X_mb_mask.shape[1]))
+                mask_zeros = mask_zeros.astype(X_mb_mask.dtype)
+                X_mb = np.concatenate((X_mb, zeros), axis=0)
+                X_mb_mask = np.concatenate((X_mb_mask, mask_zeros), axis=0)
+                assert len(X_mb[start:stop]) == cut_len
+                assert len(X_mb_mask[start:stop]) == cut_len
             bias = 0.  # No bias in training
             rval = function(X_mb[start:stop],
                             X_mb_mask[start:stop],
@@ -596,7 +602,9 @@ if __name__ == "__main__":
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)
             print("overall train costs %s" % overall_train_costs)
             print("overall valid costs %s" % overall_valid_costs)
-            checkpoint_save_path = "model_checkpoint_%i.pkl" % e
-            weights_save_path = "model_weights_%i.npz" % e
-            save_checkpoint(checkpoint_save_path, checkpoint_dict)
-            save_weights(weights_save_path, checkpoint_dict)
+            if ((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
+                print("Checkpointing...")
+                checkpoint_save_path = "model_checkpoint_%i.pkl" % e
+                weights_save_path = "model_weights_%i.npz" % e
+                save_checkpoint(checkpoint_save_path, checkpoint_dict)
+                save_weights(weights_save_path, checkpoint_dict)

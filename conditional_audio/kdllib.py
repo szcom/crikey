@@ -47,6 +47,7 @@ def soundsc(X, copy=True):
     X = 2 * X - 1
     return X.astype('float32')
 
+
 def download(url, server_fname, local_fname=None, progress_update_percentage=5,
              bypass_certificate_check=False):
     """
@@ -989,6 +990,7 @@ class base_iterator(object):
                  axis,
                  start_index=0,
                  stop_index=np.inf,
+                 randomize=False,
                  make_mask=False,
                  one_hot_class_size=None):
         self.list_of_containers = list_of_containers
@@ -996,16 +998,30 @@ class base_iterator(object):
         self.make_mask = make_mask
         self.start_index = start_index
         self.stop_index = stop_index
+        self.randomize = randomize
         self.slice_start_ = start_index
         self.axis = axis
         if axis not in [0, 1]:
             raise ValueError("Unknown sample_axis setting %i" % axis)
         self.one_hot_class_size = one_hot_class_size
+        len0 = len(list_of_containers[0])
+        assert all([len(ci) == len0 for ci in list_of_containers])
         if one_hot_class_size is not None:
             assert len(self.one_hot_class_size) == len(list_of_containers)
 
     def reset(self):
         self.slice_start_ = self.start_index
+        if self.randomize:
+            stop_ind = min(len(self.list_of_containers[0]), self.stop_index)
+            start_ind = max(0, self.start_index)
+            inds = np.arange(start_ind, stop_ind)
+            new_list_of_containers = []
+            for ci in self.list_of_containers:
+                nci = [ci[i] for i in inds]
+                if isinstance(ci, np.ndarray):
+                    nci = np.array(nci)
+                new_list_of_containers.append(nci)
+            self.list_of_containers = new_list_of_containers
 
     def __iter__(self):
         return self
@@ -1129,34 +1145,61 @@ def fetch_fruitspeech():
         y.append(tokenize_ind(cl, char2code))
 
     n_fft = 128
+
     def _pre(x):
         X_stft = stft(x, n_fft)
+        # Power spectrum
         X_mag = complex_to_abs(X_stft)
+        X_mag = np.log10(X_mag + 1E-4)
+        # unwrap phase then take delta
         X_phase = complex_to_angle(X_stft)
-        X_mag_phase = np.hstack((X_mag, X_phase))
+        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
+        # Adding zeros to make network predict what *delta* in phase makes sense
+        X_phase_unwrap = np.unwrap(X_phase, axis=0)
+        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
+        X_mag_phase = np.hstack((X_mag, X_phase_delta))
         return X_mag_phase
 
     X = [_pre(di) for di in d]
+
     X_len = np.sum([len(Xi) for Xi in X])
     X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
     X_mean = X_sum / X_len
-    X = [Xi - X_mean[None] for Xi in X]
-    X_max = max([np.max(Xi) for Xi in X])
-    X_min = min([np.min(Xi) for Xi in X])
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
 
-    def range_scale(x):
-        return (x - X_min) / (X_max - X_min)
+    def scale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = (_x - _mean) / _var
+        return x
 
-    def range_unscale(x):
-        return x * (X_max - X_min) + X_min
+    def unscale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = _x * _var + _mean
+        return x
 
-    X = [range_scale(Xi) for Xi in X]
+    X = [scale(Xi) for Xi in X]
 
     def _re(x):
-        X_mag_phase = range_unscale(x)
-        X_mag_phase = X_mag_phase + X_mean
-        X_mag = X_mag_phase[:, :n_fft // 2]
-        X_phase = X_mag_phase[:, n_fft // 2:]
+        X_mag_phase = unscale(x)
+        X_mag = 10 ** X_mag_phase[:, :n_fft // 2]
+        X_phase_delta = X_mag_phase[:, n_fft // 2:]
+        # Append leading 0s for consistency
+        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
+                                   X_phase_delta))
+        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
         X_stft = abs_and_angle_to_complex(X_mag, X_phase)
         X_r = istft(X_stft, n_fft)
         return X_r
@@ -1300,6 +1343,7 @@ def fetch_fruitspeech_nonpar():
 
     X = [_apply(Xi) for Xi in d]
     X = [dense_to_one_hot(Xi, len(sub_clusters)) for Xi in X]
+
     """
     for n, Xi in enumerate(X[all_ind[0]::8]):
         di = _re_wrap(Xi)
