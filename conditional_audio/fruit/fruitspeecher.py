@@ -30,7 +30,7 @@ if __name__ == "__main__":
     n_epochs = 2000  # Used way at the bottom in the training loop!
     checkpoint_every_n = 500
     # Was 300
-    cut_len = 40  # Used way at the bottom in the training loop!
+    cut_len = 41  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
@@ -43,6 +43,7 @@ if __name__ == "__main__":
 
     input_dim = X_mb.shape[-1]
     n_hid = 400
+    n_v_hid = 100
     att_size = 10
     n_components = 20
     n_out = X_mb.shape[-1]
@@ -228,10 +229,12 @@ if __name__ == "__main__":
     cell1 = GRU(input_dim, n_hid, random_state)
     cell2 = GRU(n_hid, n_hid, random_state)
     cell3 = GRU(n_hid, n_hid, random_state)
-
     params += cell1.get_params()
     params += cell2.get_params()
     params += cell3.get_params()
+
+    v_cell1 = GRU(1, n_v_hid, random_state)
+    params += v_cell1.get_params()
 
     # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
     inp_to_h1 = GRUFork(input_dim, n_hid, random_state)
@@ -254,17 +257,24 @@ if __name__ == "__main__":
     params += h1_to_h3.get_params()
     params += h2_to_h3.get_params()
 
+    inp_to_v_h1 = GRUFork(1, n_v_hid, random_state)
+    params += inp_to_v_h1.get_params()
+
     h1_to_att_a, h1_to_att_b, h1_to_att_k = make_weights(n_hid, 3 * [att_size],
                                                          random_state)
+    params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
+
     # Need a , on single results since it always returns a list
     h1_to_outs, = make_weights(n_hid, [n_hid], random_state)
     h2_to_outs, = make_weights(n_hid, [n_hid], random_state)
     h3_to_outs, = make_weights(n_hid, [n_hid], random_state)
-    # 2 * for mag and phase
-    outs_to_corr_outs, = make_weights(n_hid, [2 * n_density], random_state)
+    params += [h1_to_outs, h2_to_outs, h3_to_outs]
 
-    params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
-    params += [h1_to_outs, h2_to_outs, h3_to_outs, outs_to_corr_outs]
+    # 2 * for mag and phase
+    v_outs_to_corr_outs, = make_weights(n_v_hid, [1], random_state)
+    corr_outs_to_final_outs, = make_weights(n_hid, [2 * n_density],
+                                            random_state)
+    params += [v_outs_to_corr_outs, corr_outs_to_final_outs]
 
     inpt = X_sym[:-1]
     target = X_sym[1:]
@@ -346,6 +356,11 @@ if __name__ == "__main__":
     u_max = u_max.dimshuffle('x', 'x', 0)
     u_max = tensor.cast(u_max, theano.config.floatX)
 
+    def sample_out_step(x_tm1, v_h1_tm1):
+        vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(x_tm1)
+        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        return v_h1_t
+
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1, k_tm1, w_tm1, ctx):
         xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
         xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1)
@@ -386,7 +401,20 @@ if __name__ == "__main__":
                           h3_tm1)
         out_t = h1_t.dot(h1_to_outs) + h2_t.dot(h2_to_outs) + h3_t.dot(
             h3_to_outs)
-        corr_out_t = out_t.dot(outs_to_corr_outs)
+
+        out_t = out_t.dimshuffle(1, 0, 'x')
+
+        # vertical scan
+        init_v_out = tensor.zeros((out_t.shape[1], n_v_hid))
+        v_out_t, updates = theano.scan(
+            fn=sample_out_step,
+            sequences=[out_t],
+            outputs_info=[init_v_out])
+
+        corr_out_t = v_out_t.dot(v_outs_to_corr_outs)
+        corr_out_t = corr_out_t[:, :, 0].dimshuffle(1, 0)
+        corr_out_t = corr_out_t.dot(corr_outs_to_final_outs)
+
         split = corr_out_t.shape[-1] // 2
         mag_out_t = corr_out_t[:, :split]
         phase_out_t = corr_out_t[:, split:]
@@ -394,13 +422,20 @@ if __name__ == "__main__":
         mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_out_t)
         s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng)
         s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng)
+        """
+        # Set sample to debug in order to check test values
+        s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng,
+                                    debug=True)
+        s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng,
+                                      debug=True)
+        """
         s_phase = tensor.mod(s_phase + np.pi, 2 * np.pi) - np.pi
         x_t = tensor.concatenate([s_mag, s_phase], axis=-1)
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
 
+
     n_steps_sym = tensor.iscalar()
     n_steps_sym.tag.test_value = 10
-    # Set sample to debug in order to check test values
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h), supdates = theano.scan(
         fn=sample_step,
         n_steps=n_steps_sym,
@@ -429,23 +464,27 @@ if __name__ == "__main__":
 
     outs = h1.dot(h1_to_outs) + h2.dot(h2_to_outs) + h3.dot(h3_to_outs)
 
-    """
-    # Keep this hackery in place for potential RNN? Would need to find the
-    # length programmatically or force to be the same always
+    orig_shapes = outs.shape
     outs = outs.dimshuffle(2, 1, 0)
+    # pre project? cutting down to 1 dim really hurts
+    outs = outs.reshape((orig_shapes[2], orig_shapes[1] * orig_shapes[0], 1))
 
-    def out_step(x_t, x_tm1):
-        return x_t
+    def out_step(x_tm1, v_h1_tm1):
+        vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(x_tm1)
+        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        return v_h1_t
 
-    init_corr_outs = tensor.zeros((outs.shape[1], outs.shape[2]))
-    corr_outs, updates = theano.scan(
+    init_v_outs = tensor.zeros((outs.shape[1], n_v_hid))
+    v_outs, updates = theano.scan(
         fn=out_step,
         sequences=[outs],
-        outputs_info=[init_corr_outs])
-    corr_outs = corr_outs.dimshuffle(2, 1, 0)
-    """
+        outputs_info=[init_v_outs])
 
-    corr_outs = outs.dot(outs_to_corr_outs)
+    corr_outs = v_outs.dot(v_outs_to_corr_outs)
+    corr_outs = corr_outs[:, :, 0].reshape((orig_shapes[2], orig_shapes[1],
+                                            orig_shapes[0]))
+    corr_outs = corr_outs.dimshuffle(2, 1, 0)
+    corr_outs = corr_outs.dot(corr_outs_to_final_outs)
 
     split = corr_outs.shape[-1] // 2
     mag_outs = corr_outs[:, :, :split]
