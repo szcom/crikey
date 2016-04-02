@@ -162,11 +162,10 @@ def overlap(X, window_size, window_step):
     # Make sure there are an even number of windows before stridetricks
     append = np.zeros((window_size - len(X) % window_size))
     X = np.hstack((X, append))
-    num_frames = len(X) // window_step - 1
-    row_stride = X.itemsize * window_step
-    col_stride = X.itemsize
-    X_strided = as_strided(X, shape=(num_frames, window_size),
-                           strides=(row_stride, col_stride))
+    overlap_sz = window_size - window_step
+    new_shape = X.shape[:-1] + ((X.shape[-1] - overlap_sz) // window_step, window_size)
+    new_strides = X.strides[:-1] + (window_step * X.strides[-1],) + X.strides[-1:]
+    X_strided = as_strided(X, shape=new_shape, strides=new_strides)
     return X_strided
 
 
@@ -245,7 +244,6 @@ def overlap_add(X_strided, window_step, wsola=False):
     X : ndarray, shape=(n_samples,)
         Reconstructed version of X
     """
-    # Hardcoded 50% overlap! Can generalize later...
     n_rows, window_size = X_strided.shape
 
     # Start with largest size (no overlap) then truncate after we finish
@@ -269,7 +267,7 @@ def overlap_add(X_strided, window_step, wsola=False):
             X[start_index:end_index] += X_strided[i]
             total_windowing_sum[start_index:end_index] += win
             start_index += window_step
-    # Not currently using windows or window norm
+    # Not using this right now
     #X = np.real(X) / (total_windowing_sum + 1)
     X = X[:end_index]
     return X
@@ -301,8 +299,8 @@ def stft(X, fftsize=128, step="half", mean_normalize=True, real=False,
     return X
 
 
-def istft(X, fftsize=128, mean_normalize=True, real=False,
-          compute_onesided=True):
+def istft(X, fftsize=128, step="half", wsola=False, mean_normalize=True,
+          real=False, compute_onesided=True):
     """
     Compute ISTFT for STFT transformed X
     """
@@ -319,7 +317,10 @@ def istft(X, fftsize=128, mean_normalize=True, real=False,
         X_pad[:, fftsize // 2:] = 0
         X = X_pad
     X = local_ifft(X).astype("float64")
-    X = invert_halfoverlap(X)
+    if step == "half":
+        X = invert_halfoverlap(X)
+    else:
+        X = overlap_add(X, step, wsola=wsola)
     if mean_normalize:
         X -= np.mean(X)
     return X
@@ -1145,12 +1146,13 @@ def fetch_fruitspeech():
         y.append(tokenize_ind(cl, char2code))
 
     n_fft = 128
+    n_step = n_fft // 4
 
     def _pre(x):
-        X_stft = stft(x, n_fft)
+        X_stft = stft(x, n_fft, step=n_step)
         # Power spectrum
         X_mag = complex_to_abs(X_stft)
-        X_mag = np.log10(X_mag + 1E-4)
+        X_mag = np.log10(X_mag + 1E-9)
         # unwrap phase then take delta
         X_phase = complex_to_angle(X_stft)
         X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
@@ -1194,14 +1196,15 @@ def fetch_fruitspeech():
 
     def _re(x):
         X_mag_phase = unscale(x)
-        X_mag = 10 ** X_mag_phase[:, :n_fft // 2]
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_mag = 10 ** X_mag
         X_phase_delta = X_mag_phase[:, n_fft // 2:]
         # Append leading 0s for consistency
         X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
                                    X_phase_delta))
         X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
         X_stft = abs_and_angle_to_complex(X_mag, X_phase)
-        X_r = istft(X_stft, n_fft)
+        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
         return X_r
 
     """

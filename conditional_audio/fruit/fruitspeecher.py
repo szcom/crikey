@@ -27,7 +27,7 @@ if __name__ == "__main__":
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
     minibatch_size = 20
-    n_epochs = 2000  # Used way at the bottom in the training loop!
+    n_epochs = 20000  # Used way at the bottom in the training loop!
     checkpoint_every_n = 500
     # Was 300
     cut_len = 41  # Used way at the bottom in the training loop!
