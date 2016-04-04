@@ -260,8 +260,13 @@ def overlap_add(X_strided, window_step, wsola=False):
             offset_size = window_size - window_step
             offset = xcorr_offset(X[start_index:start_index + offset_size],
                                   X_strided[i, :offset_size])
-            X[start_index - offset:end_index - offset] += X_strided[i]
-            total_windowing_sum[start_index - offset:end_index - offset] += win
+            ss = start_index - offset
+            st = end_index - offset
+            if start_index - offset < 0:
+                ss = 0
+                st = 0 + (end_index - start_index)
+            X[ss:st] += X_strided[i]
+            total_windowing_sum[ss:st] += win
             start_index = start_index + window_step
         else:
             X[start_index:end_index] += X_strided[i]
@@ -1241,16 +1246,14 @@ def fetch_fruitspeech_nonpar():
     # 256 @ 8khz - .032
     ws = 2 ** int(np.log(0.032 * fs) / np.log(2))
     window_size = ws
-    # 63% overlap
-    window_step = window_size // 4 + window_size // 8
+    window_step = int(.15 * window_size)
     lpc_order = 30
     def _pre(x):
         a, g, e = lpc_analysis(x, order=lpc_order, window_step=window_step,
                                window_size=window_size, emphasis=0.9,
                                copy=True)
         f_sub = a[:, 1:]
-        """
-        f_full = stft(x, window_size, window_step, compute_onesided=False)
+        f_full = stft(x, window_size, window_step) #, compute_onesided=False)
         """
         v, p = voiced_unvoiced(x, window_size=window_size,
                                window_step=window_step)
@@ -1258,6 +1261,11 @@ def fetch_fruitspeech_nonpar():
         e = e[:cut_len]
         e = e.reshape((len(a), -1))
         f_full = np.hstack((a, g, v, e))
+        """
+        if len(f_sub) >= len(f_full):
+            f_sub = f_sub[:len(f_full)]
+        else:
+            f_full = f_full[:len(f_sub)]
         return f_sub, f_full
 
     def _train(list_of_data):
@@ -1280,7 +1288,7 @@ def fetch_fruitspeech_nonpar():
         full_clusters = f_full
         return sub_clusters, full_clusters
 
-    def _clust(x, sub_clusters):
+    def _clust(x, sub_clusters, extras=None):
         f_sub, f_full = _pre(x)
         f_clust = f_sub
         mem, _ = vq(copy.deepcopy(f_clust), copy.deepcopy(sub_clusters))
@@ -1298,15 +1306,7 @@ def fetch_fruitspeech_nonpar():
         x_r = iterate_invert_spectrogram(vq_x, window_size, window_step,
                                          n_iter=50, complex_input=True)
         """
-        """
-        X = vq_x
-        x_r = istft(X, window_size)
-        X_pad = np.zeros((X.shape[0], 2 * X.shape[1])) + 0j
-        X_pad[:, :window_size // 2] = X
-        X_pad[:, window_size // 2:] = 0
-        X = X_pad
-        ts_x = fftpack.ifft(X)
-        x_r = overlap_add(ts_x, window_step, wsola=True)
+        x_r = istft(vq_x, window_size, window_step, wsola=True)
         """
         a = vq_x[:, :lpc_order + 1]
         offset = lpc_order + 1
@@ -1317,10 +1317,8 @@ def fetch_fruitspeech_nonpar():
         e = vq_x[:, offset:].ravel()
         x_r = lpc_synthesis(a, g, e, voiced_frames=v,
                             emphasis=0.9, window_step=window_step)
-        try:
-            agc_x_r, _, _ = time_attack_agc(x_r, fs)
-        except:
-            agc_x_r = x_r
+        """
+        agc_x_r, _, _ = time_attack_agc(x_r, fs)
         return agc_x_r
 
     random_state = np.random.RandomState(1999)
@@ -1334,6 +1332,7 @@ def fetch_fruitspeech_nonpar():
         d1 += d[i::8]
 
     sub_clusters, full_clusters = _train(d1)
+
 
     def _re_wrap(x):
         x = x.argmax(axis=-1)

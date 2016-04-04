@@ -639,8 +639,8 @@ if __name__ == "__main__":
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)
-            print("overall train costs %s" % overall_train_costs)
-            print("overall valid costs %s" % overall_valid_costs)
+            print("overall train costs %s" % overall_train_costs[-5:])
+            print("overall valid costs %s" % overall_valid_costs[-5:])
             if ((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
                 print("Checkpointing...")
                 checkpoint_save_path = "model_checkpoint_%i.pkl" % e
