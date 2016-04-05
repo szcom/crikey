@@ -524,7 +524,7 @@ if __name__ == "__main__":
     grads = tensor.grad(cost, params)
     grads = gradient_clipping(grads, 10.)
 
-    learning_rate = 1E-4
+    learning_rate = 1E-3
 
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)

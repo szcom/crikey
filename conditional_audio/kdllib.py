@@ -1877,29 +1877,27 @@ def diagonal_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
 
 
 def single_dimensional_gmm(true, mu, sigma, coeff, epsilon=1E-5):
-    n_dim = true.ndim
     shape_t = true.shape
     true = true.reshape((-1, shape_t[-1]))
     true = true.dimshuffle(0, 1, 'x')
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
     inner += tensor.sqr((true - mu) / sigma)
     inner = -0.5 * inner
-    nll = -logsumexp(tensor.log(coeff) + inner, axis=n_dim-1)
-    nll = nll.sum(axis=1)
+    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1),
+                     axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 
 
 def single_dimensional_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
-    n_dim = true.ndim
     shape_t = true.shape
     true = true.reshape((-1, shape_t[-1]))
     true = true.dimshuffle(0, 1, 'x')
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
     inner += tensor.sqr((true - mu) / sigma)
     inner = -0.5 * inner
-    nll = -logsumexp(tensor.log(coeff) + inner, axis=n_dim-1)
-    nll = nll.sum(axis=1)
+    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1),
+                     axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 
