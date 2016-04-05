@@ -9,11 +9,19 @@ from scipy.io import wavfile
 import scipy.signal as sg
 import tarfile
 import os
+import glob
 import re
 import copy
 from collections import Counter
+import time
 import sys
 import pickle
+import itertools
+try:
+    import Queue
+except ImportError:
+    import queue as Queue
+import threading
 import theano
 import theano.tensor as tensor
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
@@ -88,6 +96,224 @@ def download(url, server_fname, local_fname=None, progress_update_percentage=5,
                                                100. / file_size)
                 print(status)
                 p += progress_update_percentage
+
+
+
+
+class BlizzardThread(threading.Thread):
+    """Blizzard Thread"""
+    def __init__(self, queue, out_queue, preproc_fn):
+        threading.Thread.__init__(self)
+        self.queue = queue
+        self.out_queue = out_queue
+        self.preproc_fn = preproc_fn
+
+    def run(self):
+        while True:
+            # Grabs image path from queue
+            wav_paths, texts = self.queue.get()
+            text_group = texts
+            wav_group = [wavfile.read(wp)[1] for wp in wav_paths]
+            wav_group = [w.astype('float32') / (2 ** 15) for w in wav_group]
+            wav_group = [self.preproc_fn(wi) for wi in wav_group]
+            self.out_queue.put((wav_group, text_group))
+            self.queue.task_done()
+
+
+class Blizzard_dataset(object):
+    def __init__(self, minibatch_size=2,
+                 blizzard_path='/home/kkastner/blizzard_data'):
+        self.n_fft = 256
+        self.n_step = self.n_fft // 4
+        self.blizzard_path = blizzard_path
+        # extracted text
+        self.text_path = os.path.join(self.blizzard_path, 'train', 'segmented',
+                                      'prompts.gui')
+        with open(self.text_path, 'r') as f:
+            tt = f.readlines()
+            wav_names = [t.strip() for t in tt[::3]]
+            raw_other = tt[2::3]
+            raw_text = [t.strip().lower() for t in tt[1::3]]
+            all_symbols = set()
+            for rt in raw_text:
+                all_symbols = set(list(all_symbols) + list(set(rt)))
+            self.wav_names = wav_names
+            self.text = raw_text
+            self.symbols = sorted(list(all_symbols))
+        import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+        raise ValueError()
+        # These files come from converting the Blizzard mp3 files to wav,
+        # then placing in a directory called blizzard_wav
+        self.wav_paths = glob.glob(os.path.join(self.blizzard_path,
+                                                'blizzard_wav', '*.wav'))
+        self.minibatch_size = minibatch_size
+        self._lens = np.array([float(len(t)) for t in self.text])
+
+        # Get only the smallest 50% of files for now
+        _cut = np.percentile(self._lens, 5)
+        _ind = np.where(self._lens <= _cut)[0]
+
+        self.text = [self.text[i] for i in _ind]
+        self.wav_names = [self.wav_names[i] for i in _ind]
+        assert len(self.text) == len(self.wav_names)
+        final_wav_paths = []
+        final_text = []
+        final_wav_names = []
+        for n, (w, t) in enumerate(zip(self.wav_names, self.text)):
+            parts = w.split("chp")
+            name = parts[0]
+            chapter = [pp for pp in parts[1].split("_") if pp != ''][0]
+            for p in self.wav_paths:
+                if name in p and chapter in p:
+                    final_wav_paths.append(p)
+                    final_wav_names.append(w)
+                    final_text.append(t)
+                    import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+                    raise ValueError()
+                    break
+
+        # resort into shortest -> longest order
+        sorted_inds = np.argsort([len(t) for t in final_text])
+        st = [final_text[i] for i in sorted_inds]
+        swp = [final_wav_paths[i] for i in sorted_inds]
+        swn = [final_wav_names[i] for i in sorted_inds]
+        self.wav_names = swn
+        self.wav_paths = swp
+        self.text = st
+        assert len(self.wav_names) == len(self.wav_paths)
+        assert len(self.wav_paths) == len(self.text)
+
+        self.n_per_epoch = len(self.wav_paths)
+        self.n_samples_seen_ = 0
+
+        self.buffer_size = 2
+        self.minibatch_size = minibatch_size
+        self.input_qsize = 5
+        self.min_input_qsize = 2
+        if len(self.wav_paths) % self.minibatch_size != 0:
+            print("WARNING: Sample size not an even multiple of minibatch size")
+            print("Truncating...")
+            self.wav_paths = self.wav_paths[:-(
+                len(self.wav_paths) % self.minibatch_size)]
+            self.text = self.text[:-(
+                len(self.text) % self.minibatch_size)]
+
+        assert len(self.wav_paths) % self.minibatch_size == 0
+        assert len(self.text) % self.minibatch_size == 0
+
+        self.grouped_wav_paths = zip(*[iter(self.wav_paths)] *
+                                      self.minibatch_size)
+        self.grouped_text = zip(*[iter(self.text)] *
+                                     self.minibatch_size)
+        assert len(self.grouped_wav_paths) == len(self.grouped_text)
+        self._init_queues()
+
+    def _init_queues(self):
+        # Infinite...
+        self.grouped_elements = itertools.cycle(zip(self.grouped_wav_paths,
+                                                self.grouped_text))
+        self.queue = Queue.Queue()
+        self.out_queue = Queue.Queue(maxsize=self.buffer_size)
+
+        for i in range(1):
+            self.it = BlizzardThread(self.queue, self.out_queue, self._pre)
+            self.it.setDaemon(True)
+            self.it.start()
+
+        # Populate queue with some paths to image data
+        for n, _ in enumerate(range(self.input_qsize)):
+            group = self.grouped_elements.next()
+            self.queue.put(group)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def next(self):
+        return self._step()
+
+    def reset(self):
+        self.n_samples_seen_ = 0
+        self._init_queues()
+
+    def _step(self):
+        if self.n_samples_seen_ >= self.n_per_epoch:
+            self.reset()
+            raise StopIteration("End of epoch")
+        wav_group, text_group = self.out_queue.get()
+        self.n_samples_seen_ += self.minibatch_size
+        if self.queue.qsize() <= self.min_input_qsize:
+            for i in range(self.input_qsize):
+                group = self.grouped_elements.next()
+                self.queue.put(group)
+        return wav_group, text_group
+
+    def _pre(self, x):
+        n_fft = self.n_fft
+        n_step = self.n_step
+        X_stft = stft(x, n_fft, step=n_step)
+        # Power spectrum
+        X_mag = complex_to_abs(X_stft)
+        X_mag = np.log10(X_mag + 1E-9)
+        # unwrap phase then take delta
+        X_phase = complex_to_angle(X_stft)
+        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
+        # Adding zeros to make network predict what *delta* in phase makes sense
+        X_phase_unwrap = np.unwrap(X_phase, axis=0)
+        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
+        X_mag_phase = np.hstack((X_mag, X_phase_delta))
+        return X_mag_phase
+
+    def _re(self, x):
+        n_fft = self.n_fft
+        n_step = self.n_step
+        # X_mag_phase = unscale(x)
+        X_mag_phase = x
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_mag = 10 ** X_mag
+        X_phase_delta = X_mag_phase[:, n_fft // 2:]
+        # Append leading 0s for consistency
+        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
+                                   X_phase_delta))
+        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
+        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
+        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
+        return X_r
+
+    """
+    # Can't figure out how to do this yet...
+    # Iterators R hard
+    X = [_pre(di) for di in d]
+    X_len = np.sum([len(Xi) for Xi in X])
+    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
+    X_mean = X_sum / X_len
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
+
+    def scale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = (_x - _mean) / _var
+        return x
+
+    def unscale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = _x * _var + _mean
+        return x
+    """
 
 
 def fetch_sample_speech_fruit(n_samples=None):
@@ -284,10 +510,10 @@ def stft(X, fftsize=128, step="half", mean_normalize=True, real=False,
     Compute STFT for 1D real valued input X
     """
     if real:
-        local_fft = np.fft.rfft
+        local_fft = fftpack.rfft
         cut = -1
     else:
-        local_fft = np.fft.fft
+        local_fft = fftpack.fft
         cut = None
     if compute_onesided:
         cut = fftsize // 2
@@ -310,12 +536,12 @@ def istft(X, fftsize=128, step="half", wsola=False, mean_normalize=True,
     Compute ISTFT for STFT transformed X
     """
     if real:
-        local_ifft = np.fft.irfft
+        local_ifft = fftpack.irfft
         X_pad = np.zeros((X.shape[0], X.shape[1] + 1)) + 0j
         X_pad[:, :-1] = X
         X = X_pad
     else:
-        local_ifft = np.fft.ifft
+        local_ifft = fftpack.ifft
     if compute_onesided:
         X_pad = np.zeros((X.shape[0], 2 * X.shape[1])) + 0j
         X_pad[:, :fftsize // 2] = X
@@ -1650,6 +1876,34 @@ def diagonal_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
     return nll
 
 
+def single_dimensional_gmm(true, mu, sigma, coeff, epsilon=1E-5):
+    n_dim = true.ndim
+    shape_t = true.shape
+    true = true.reshape((-1, shape_t[-1]))
+    true = true.dimshuffle(0, 1, 'x')
+    inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
+    inner += tensor.sqr((true - mu) / sigma)
+    inner = -0.5 * inner
+    nll = -logsumexp(tensor.log(coeff) + inner, axis=n_dim-1)
+    nll = nll.sum(axis=1)
+    nll = nll.reshape((shape_t[0], shape_t[1]))
+    return nll
+
+
+def single_dimensional_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
+    n_dim = true.ndim
+    shape_t = true.shape
+    true = true.reshape((-1, shape_t[-1]))
+    true = true.dimshuffle(0, 1, 'x')
+    inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
+    inner += tensor.sqr((true - mu) / sigma)
+    inner = -0.5 * inner
+    nll = -logsumexp(tensor.log(coeff) + inner, axis=n_dim-1)
+    nll = nll.sum(axis=1)
+    nll = nll.reshape((shape_t[0], shape_t[1]))
+    return nll
+
+
 def bernoulli_and_bivariate_gmm(true, mu, sigma, corr, coeff, binary,
                                 epsilon=1E-5):
     n_dim = true.ndim
@@ -1831,7 +2085,25 @@ def load_checkpoint(saved_checkpoint_path):
     sys.setrecursionlimit(old_recursion_limit)
     return pickle_item
 
+def run_blizzard_example():
+    bliz = Blizzard_dataset()
+    start = time.time()
+    itr = 1
+    while True:
+        r = bliz.next()
+        stop = time.time()
+        tot = stop - start
+        print("Threaded time: %s" % (tot))
+        print("Minibatch %s" % str(itr))
+        print("Time ratio (s per minibatch): %s" % (tot / float(itr)))
+        itr += 1
+        break
+    import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+    raise ValueError()
+
+
 
 if __name__ == "__main__":
     #run_fft_dct_example()
-    run_lpc_example()
+    #run_lpc_example()
+    run_blizzard_example()
