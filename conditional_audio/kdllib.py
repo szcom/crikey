@@ -1849,6 +1849,23 @@ def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5,
     return s
 
 
+def sample_single_dimensional_gmms(mu, sigma, coeff, theano_rng, epsilon=1E-5,
+                                   debug=False):
+    if debug:
+        idx = tensor.argmax(coeff, axis=1)
+    else:
+        idx = tensor.argmax(
+            theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype), axis=1)
+    mu = mu[tensor.arange(mu.shape[0]), :, idx]
+    sigma = sigma[tensor.arange(sigma.shape[0]), :, idx]
+    if debug:
+        z = 0.
+    else:
+        z = theano_rng.normal(size=mu.shape, avg=0., std=1., dtype=mu.dtype)
+    s = mu + sigma * z
+    return s
+
+
 def diagonal_gmm(true, mu, sigma, coeff, epsilon=1E-5):
     n_dim = true.ndim
     shape_t = true.shape
@@ -1876,28 +1893,28 @@ def diagonal_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
     return nll
 
 
-def single_dimensional_gmm(true, mu, sigma, coeff, epsilon=1E-5):
+def single_dimensional_gmms(true, mu, sigma, coeff, epsilon=1E-5):
     shape_t = true.shape
     true = true.reshape((-1, shape_t[-1]))
     true = true.dimshuffle(0, 1, 'x')
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
     inner += tensor.sqr((true - mu) / sigma)
     inner = -0.5 * inner
-    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1),
-                     axis=1)
+    ll = logsumexp(tensor.log(coeff) + inner, axis=inner.ndim-1)
+    nll = -logsumexp(ll, axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 
 
-def single_dimensional_phase_gmm(true, mu, sigma, coeff, epsilon=1E-5):
+def single_dimensional_phase_gmms(true, mu, sigma, coeff, epsilon=1E-5):
     shape_t = true.shape
     true = true.reshape((-1, shape_t[-1]))
     true = true.dimshuffle(0, 1, 'x')
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
     inner += tensor.sqr((true - mu) / sigma)
     inner = -0.5 * inner
-    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1),
-                     axis=1)
+    ll = logsumexp(tensor.log(coeff) + inner, axis=inner.ndim-1)
+    nll = -logsumexp(ll, axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 

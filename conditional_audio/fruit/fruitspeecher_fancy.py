@@ -9,8 +9,8 @@ from kdllib import load_checkpoint, dense_to_one_hot, plot_lines_iamondb_example
 from kdllib import fetch_fruitspeech, list_iterator, np_zeros, GRU, GRUFork
 from kdllib import make_weights, as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
-from kdllib import save_checkpoint, save_weights, sample_diagonal_gmm
-from kdllib import single_dimensional_gmm, single_dimensional_phase_gmm, soundsc
+from kdllib import save_checkpoint, save_weights, sample_single_dimensional_gmms
+from kdllib import single_dimensional_gmms, single_dimensional_phase_gmms, soundsc
 
 
 if __name__ == "__main__":
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     X = np.array([x.astype(theano.config.floatX) for x in X])
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
-    minibatch_size = 10
+    minibatch_size = 20
     n_epochs = 20000  # Used way at the bottom in the training loop!
     checkpoint_every_n = 500
     # Was 300
@@ -118,6 +118,7 @@ if __name__ == "__main__":
 
         X_mb, X_mb_mask, c_mb, c_mb_mask = next(valid_itr)
         valid_itr.reset()
+
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
         prev_kappa = np_zeros((minibatch_size, att_size))
@@ -140,6 +141,7 @@ if __name__ == "__main__":
                 c_mb_mask = np.ones_like(c_mb[:, :, 0])
 
             if args.sample_length is None:
+                raise ValueError("Broken...")
                 # Automatic sampling stop as described in Graves' paper
                 # Assume an average of 30 timesteps per char
                 n_steps = 30 * c_mb.shape[0]
@@ -176,14 +178,21 @@ if __name__ == "__main__":
                 cond = c_mb[:, np.array(list(completed_indices))]
             else:
                 fixed_steps = args.sample_length
-                rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                        prev_h3, prev_kappa, prev_w, bias,
-                                        fixed_steps)
-                sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                completed = [sampled[:, i]
-                             for i in range(sampled.shape[1])]
+                completed = []
+                for i in range(fixed_steps):
+                    rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
+                                            prev_h3, prev_kappa, prev_w, bias)
+                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
+                    completed.append(sampled)
+                    prev_h1 = h1_s
+                    prev_h2 = h2_s
+                    prev_h3 = h3_s
+                    prev_kappa = k_s
+                    prev_w = w_s
                 cond = c_mb
                 print("Completed sampling after %i steps" % fixed_steps)
+            # Minibatch size first
+            completed = np.array(completed).transpose(1, 0, 2)
             rlookup = {v: k for k, v in vocabulary.items()}
             for i in range(len(completed)):
                 ex = completed[i]
@@ -422,32 +431,37 @@ if __name__ == "__main__":
             mu_mag, sigma_mag, coeff_mag = _slice_outs(o)
             mu_phase, sigma_phase, coeff_phase = _slice_outs(o)
             # Filthiest of the filthy hacks
-            s = tensor.ge(64, c_t)
+            s = tensor.ge(switch, c_t)
             mu = s * (mu_mag) + (1 - s) * (mu_phase)
             sigma = s * (sigma_mag) + (1 - s) * (sigma_phase)
             coeff = s * (coeff_mag) + (1 - s) * (coeff_phase)
             mu = mu[0].dimshuffle(0, 'x', 1)
             sigma = sigma[0].dimshuffle(0, 'x', 1)
             coeff = coeff[0]
-            samp_mag = sample_diagonal_gmm(mu, sigma, coeff, srng,
-                                           debug=True)
-            samp_phase = sample_diagonal_gmm(mu, sigma, coeff, srng,
-                                             debug=True)
+            samp_mag = sample_single_dimensional_gmms(mu, sigma, coeff, srng,
+                                                      debug=True)
+            samp_phase = sample_single_dimensional_gmms(mu, sigma, coeff, srng,
+                                                        debug=True)
             samp_phase = tensor.mod(samp_phase + np.pi, 2 * np.pi) - np.pi
             samp = s * samp_mag + (1 - s) * samp_phase
             return samp, v_h1_t
 
         init_corr_out = tensor.zeros((out_t.shape[1], n_density))
         init_samp_out = tensor.zeros((out_t.shape[1], 1))
-        r, updates = theano.scan(
+        r, isupdates = theano.scan(
             fn=sample_out_step,
             sequences=[counter, out_t],
             outputs_info=[init_samp_out, init_corr_out])
         corr_out_t = r[0]
         x_t = corr_out_t.dimshuffle(2, 1, 0)[0]
-        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
+        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
 
 
+    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, isupdates) = sample_step(
+        init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
+
+    """
+    # Old multistep code which doesn't work with updates in the internal scan
     n_steps_sym = tensor.iscalar()
     n_steps_sym.tag.test_value = 10
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h), supdates = theano.scan(
@@ -457,17 +471,8 @@ if __name__ == "__main__":
         outputs_info=[init_x, init_h1, init_h2, init_h3,
                       init_kappa, init_w, None, None],
         non_sequences=[context])
-
     """
-    # Testing step function
-    r = step(inp_h1[0], inpgate_h1[0], inp_h2[0], inpgate_h2[0],
-             inp_h3[0], inpgate_h3[0],
-             init_h1, init_h2, init_h3, init_kappa, init_w, context)
 
-    r = step(inp_h1[1], inpgate_h1[1], inp_h2[1], inpgate_h2[1],
-             inp_h3[1], inpgate_h3[1],
-             r[0], r[1], r[2], r[3], r[4], context)
-    """
     (h1, h2, h3, kappa, w), updates = theano.scan(
         fn=step,
         sequences=[inp_h1, inpgate_h1,
@@ -512,19 +517,19 @@ if __name__ == "__main__":
     mag_target = target[:, :, :target_split]
     phase_target = target[:, :, target_split:]
 
-    mag_cost = single_dimensional_gmm(
+    mag_cost = single_dimensional_gmms(
         mag_target, mu_mag, sigma_mag, coeff_mag)
-    phase_cost = single_dimensional_phase_gmm(
+    phase_cost = single_dimensional_phase_gmms(
         phase_target, mu_phase, sigma_phase, coeff_phase)
 
     cost = mag_cost + phase_cost
 
     cost = cost * mask
-    cost = cost.sum() / (minibatch_size * cut_len)
+    cost = cost.sum() / cut_len
     grads = tensor.grad(cost, params)
     grads = gradient_clipping(grads, 10.)
 
-    learning_rate = 1E-3
+    learning_rate = 1E-4
 
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
@@ -548,11 +553,11 @@ if __name__ == "__main__":
                                           init_w],
                                          [kappa, w], on_unused_input='warn')
     sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
-                                       init_h3, init_kappa, init_w, bias_sym,
-                                       n_steps_sym],
+                                       init_h3, init_kappa, init_w, bias_sym],
                                       [sampled, h1_s, h2_s, h3_s, k_s, w_s,
                                        stop_s, stop_h],
-                                      updates=supdates)
+                                      updates=isupdates,
+                                      on_unused_input='warn')
 
     checkpoint_dict = {}
     checkpoint_dict["train_function"] = train_function
@@ -652,6 +657,8 @@ if __name__ == "__main__":
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
+            script = os.path.realpath(__file__)
+            print("Script %s" % script)
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)
