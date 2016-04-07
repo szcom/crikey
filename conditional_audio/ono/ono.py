@@ -25,6 +25,7 @@ if __name__ == "__main__":
     fs = speech["sample_rate"]
     X = np.array([x.astype(theano.config.floatX) for x in X])
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
+    
 
     minibatch_size = 5
     n_epochs = 20000  # Used way at the bottom in the training loop!
@@ -508,7 +509,7 @@ if __name__ == "__main__":
     grads = tensor.grad(cost, params)
     grads = gradient_clipping(grads, 10.)
 
-    learning_rate = 1E-3
+    learning_rate = 1E-4
 
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)

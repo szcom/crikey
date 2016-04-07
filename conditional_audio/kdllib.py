@@ -1687,7 +1687,7 @@ def fetch_ono():
             final_classes.append("uw")
         else:
             raise ValueError("Unknown class %s" % c)
-        
+    classes = final_classes
     all_chars = [c for c in sorted(list(set("".join(classes))))]
     char2code = {v: k for k, v in enumerate(all_chars)}
     vocabulary_size = len(char2code.keys())
