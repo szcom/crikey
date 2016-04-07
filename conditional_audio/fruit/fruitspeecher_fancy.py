@@ -438,10 +438,8 @@ if __name__ == "__main__":
             mu = mu[0].dimshuffle(0, 'x', 1)
             sigma = sigma[0].dimshuffle(0, 'x', 1)
             coeff = coeff[0]
-            samp_mag = sample_single_dimensional_gmms(mu, sigma, coeff, srng,
-                                                      debug=True)
-            samp_phase = sample_single_dimensional_gmms(mu, sigma, coeff, srng,
-                                                        debug=True)
+            samp_mag = sample_single_dimensional_gmms(mu, sigma, coeff, srng)
+            samp_phase = sample_single_dimensional_gmms(mu, sigma, coeff, srng)
             samp_phase = tensor.mod(samp_phase + np.pi, 2 * np.pi) - np.pi
             samp = s * samp_mag + (1 - s) * samp_phase
             return samp, v_h1_t
@@ -457,7 +455,7 @@ if __name__ == "__main__":
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
 
 
-    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, isupdates) = sample_step(
+    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, supdates) = sample_step(
         init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
 
     """
@@ -556,7 +554,7 @@ if __name__ == "__main__":
                                        init_h3, init_kappa, init_w, bias_sym],
                                       [sampled, h1_s, h2_s, h3_s, k_s, w_s,
                                        stop_s, stop_h],
-                                      updates=isupdates,
+                                      updates=supdates,
                                       on_unused_input='warn')
 
     checkpoint_dict = {}

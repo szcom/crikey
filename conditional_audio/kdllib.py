@@ -1900,8 +1900,7 @@ def single_dimensional_gmms(true, mu, sigma, coeff, epsilon=1E-5):
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
     inner += tensor.sqr((true - mu) / sigma)
     inner = -0.5 * inner
-    ll = logsumexp(tensor.log(coeff) + inner, axis=inner.ndim-1)
-    nll = -logsumexp(ll, axis=1)
+    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1), axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 
@@ -1910,11 +1909,11 @@ def single_dimensional_phase_gmms(true, mu, sigma, coeff, epsilon=1E-5):
     shape_t = true.shape
     true = true.reshape((-1, shape_t[-1]))
     true = true.dimshuffle(0, 1, 'x')
+    inner0 = np.pi - abs(tensor.mod(true - mu, 2 * np.pi) - np.pi)
     inner = tensor.log(2 * np.pi) + 2 * tensor.log(sigma)
-    inner += tensor.sqr((true - mu) / sigma)
+    inner += tensor.sqr(inner0 / sigma)
     inner = -0.5 * inner
-    ll = logsumexp(tensor.log(coeff) + inner, axis=inner.ndim-1)
-    nll = -logsumexp(ll, axis=1)
+    nll = -logsumexp(tensor.sum(tensor.log(coeff) + inner, axis=1), axis=1)
     nll = nll.reshape((shape_t[0], shape_t[1]))
     return nll
 
