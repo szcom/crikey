@@ -6,17 +6,17 @@ from scipy.io import wavfile
 import os
 import sys
 from kdllib import load_checkpoint, dense_to_one_hot, plot_lines_iamondb_example
-from kdllib import fetch_fruitspeech, list_iterator, np_zeros, GRU, GRUFork
+from kdllib import fetch_ono, list_iterator, np_zeros, GRU, GRUFork
 from kdllib import make_weights, as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
-from kdllib import save_checkpoint, save_weights, sample_single_dimensional_gmms
-from kdllib import single_dimensional_gmms, single_dimensional_phase_gmms, soundsc
+from kdllib import save_checkpoint, save_weights, sample_diagonal_gmm
+from kdllib import diagonal_gmm, diagonal_phase_gmm, soundsc
 
 
 if __name__ == "__main__":
     import argparse
 
-    speech = fetch_fruitspeech()
+    speech = fetch_ono()
     X = speech["data"]
     y = speech["target"]
     vocabulary = speech["vocabulary"]
@@ -26,16 +26,16 @@ if __name__ == "__main__":
     X = np.array([x.astype(theano.config.floatX) for x in X])
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
-    minibatch_size = 20
+    minibatch_size = 5
     n_epochs = 20000  # Used way at the bottom in the training loop!
     checkpoint_every_n = 500
     # Was 300
-    cut_len = 41  # Used way at the bottom in the training loop!
+    cut_len = 40  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
-    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
+    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=40,
                               randomize=True, make_mask=True)
-    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=80,
+    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=40,
                               make_mask=True)
 
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
@@ -45,12 +45,12 @@ if __name__ == "__main__":
     n_hid = 400
     n_v_hid = 100
     att_size = 10
-    n_components = 3
+    n_components = 20
     n_out = X_mb.shape[-1]
     n_chars = vocabulary_size
-    # 2 * for magnitude and phase
-    # one for mu, one for sigma then n_components for the mixture weights
-    n_density = 2 * n_components + n_components
+    # mag and phase each n_out // 2
+    # one 2 for mu, sigma , + n_components for coeff
+    n_density = 2 * n_out // 2 * n_components + n_components
 
     desc = "Speech generation"
     parser = argparse.ArgumentParser(description=desc)
@@ -118,7 +118,6 @@ if __name__ == "__main__":
 
         X_mb, X_mb_mask, c_mb, c_mb_mask = next(valid_itr)
         valid_itr.reset()
-
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
         prev_kappa = np_zeros((minibatch_size, att_size))
@@ -141,7 +140,6 @@ if __name__ == "__main__":
                 c_mb_mask = np.ones_like(c_mb[:, :, 0])
 
             if args.sample_length is None:
-                raise ValueError("Broken...")
                 # Automatic sampling stop as described in Graves' paper
                 # Assume an average of 30 timesteps per char
                 n_steps = 30 * c_mb.shape[0]
@@ -178,21 +176,14 @@ if __name__ == "__main__":
                 cond = c_mb[:, np.array(list(completed_indices))]
             else:
                 fixed_steps = args.sample_length
-                completed = []
-                for i in range(fixed_steps):
-                    rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                            prev_h3, prev_kappa, prev_w, bias)
-                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                    completed.append(sampled)
-                    prev_h1 = h1_s
-                    prev_h2 = h2_s
-                    prev_h3 = h3_s
-                    prev_kappa = k_s
-                    prev_w = w_s
+                rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
+                                        prev_h3, prev_kappa, prev_w, bias,
+                                        fixed_steps)
+                sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
+                completed = [sampled[:, i]
+                             for i in range(sampled.shape[1])]
                 cond = c_mb
                 print("Completed sampling after %i steps" % fixed_steps)
-            # Minibatch size first
-            completed = np.array(completed).transpose(1, 0, 2)
             rlookup = {v: k for k, v in vocabulary.items()}
             for i in range(len(completed)):
                 ex = completed[i]
@@ -242,7 +233,7 @@ if __name__ == "__main__":
     params += cell2.get_params()
     params += cell3.get_params()
 
-    v_cell1 = GRU(2, n_density, random_state)
+    v_cell1 = GRU(1, n_v_hid, random_state)
     params += v_cell1.get_params()
 
     # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
@@ -266,7 +257,7 @@ if __name__ == "__main__":
     params += h1_to_h3.get_params()
     params += h2_to_h3.get_params()
 
-    inp_to_v_h1 = GRUFork(2, n_density, random_state)
+    inp_to_v_h1 = GRUFork(1, n_v_hid, random_state)
     params += inp_to_v_h1.get_params()
 
     h1_to_att_a, h1_to_att_b, h1_to_att_k = make_weights(n_hid, 3 * [att_size],
@@ -274,18 +265,16 @@ if __name__ == "__main__":
     params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
 
     # Need a , on single results since it always returns a list
-    h1_to_outs, = make_weights(n_hid, [input_dim], random_state)
-    h2_to_outs, = make_weights(n_hid, [input_dim], random_state)
-    h3_to_outs, = make_weights(n_hid, [input_dim], random_state)
+    h1_to_outs, = make_weights(n_hid, [n_hid], random_state)
+    h2_to_outs, = make_weights(n_hid, [n_hid], random_state)
+    h3_to_outs, = make_weights(n_hid, [n_hid], random_state)
     params += [h1_to_outs, h2_to_outs, h3_to_outs]
 
-    """
     # 2 * for mag and phase
-    corr_outs_to_final_outs, = make_weights(1, [2 * n_density],
-                                            random_state)
     v_outs_to_corr_outs, = make_weights(n_v_hid, [1], random_state)
+    corr_outs_to_final_outs, = make_weights(n_hid, [2 * n_density],
+                                            random_state)
     params += [v_outs_to_corr_outs, corr_outs_to_final_outs]
-    """
 
     inpt = X_sym[:-1]
     target = X_sym[1:]
@@ -350,32 +339,27 @@ if __name__ == "__main__":
     init_x = as_shared(np_zeros((minibatch_size, n_out)))
     srng = RandomStreams(1999)
 
+    def _slice_outs(outs):
+        k = n_components
+        half = n_out // 2
+        outs = outs.reshape((-1, n_density))
+        mu = outs[:, 0:half * k].reshape((-1, half, k))
+        sigma = outs[:, half * k:2 * half * k].reshape(
+            (-1, half, k))
+        coeff = outs[:, 2 * half * k:]
+        sigma = tensor.exp(sigma - bias_sym) + 1E-6
+        coeff = tensor.nnet.softmax(coeff * (1. + bias_sym)) + 1E-6
+        return mu, sigma, coeff
+
     # Used to calculate stopping heuristic from sections 5.3
     u_max = 0. * tensor.arange(c_sym.shape[0]) + c_sym.shape[0]
     u_max = u_max.dimshuffle('x', 'x', 0)
     u_max = tensor.cast(u_max, theano.config.floatX)
 
-    def _slice_outs(outs):
-        k = n_components
-        if outs.ndim == 4:
-            def _r(i):
-                i = i.dimshuffle(0, 2, 1, 3)
-                return i.reshape((-1, i.shape[2], i.shape[3]))
-            mu = _r(outs[:, :, :, 0:k])
-            sigma = _r(outs[:, :, :, k:2 * k])
-            coeff = _r(outs[:, :, :, 2 * k:])
-        elif outs.ndim == 3:
-            mu = outs[:, :, 0:k]
-            sigma = outs[:, :, k:2 * k]
-            coeff = outs[:, :, 2 * k:]
-        else:
-            raise ValueError("Unknown ndim in _slice_outs!")
-        coeff_orig_shape = coeff.shape
-        sigma = tensor.exp(sigma - bias_sym) + 1E-6
-        coeff = tensor.nnet.softmax(
-            coeff.reshape((-1, k)) * (1. + bias_sym)) + 1E-6
-        coeff = coeff.reshape(coeff_orig_shape)
-        return mu, sigma, coeff
+    def sample_out_step(x_tm1, v_h1_tm1):
+        vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(x_tm1)
+        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        return v_h1_t
 
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1, k_tm1, w_tm1, ctx):
         xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
@@ -419,47 +403,37 @@ if __name__ == "__main__":
             h3_to_outs)
 
         out_t = out_t.dimshuffle(1, 0, 'x')
-        counter = tensor.arange(out_t.shape[0])
-        switch = out_t.shape[0] // 2
 
-        def sample_out_step(c_t, o_tm1, x_tm1, v_h1_tm1):
-            j_tm1 = tensor.concatenate((x_tm1, o_tm1), axis=1)
-            vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(j_tm1)
-
-            v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
-            o = v_h1_t.dimshuffle('x', 0, 'x', 1)
-            mu_mag, sigma_mag, coeff_mag = _slice_outs(o)
-            mu_phase, sigma_phase, coeff_phase = _slice_outs(o)
-            # Filthiest of the filthy hacks
-            s = tensor.ge(switch, c_t)
-            mu = s * (mu_mag) + (1 - s) * (mu_phase)
-            sigma = s * (sigma_mag) + (1 - s) * (sigma_phase)
-            coeff = s * (coeff_mag) + (1 - s) * (coeff_phase)
-            mu = mu[0].dimshuffle(0, 'x', 1)
-            sigma = sigma[0].dimshuffle(0, 'x', 1)
-            coeff = coeff[0]
-            samp_mag = sample_single_dimensional_gmms(mu, sigma, coeff, srng)
-            samp_phase = sample_single_dimensional_gmms(mu, sigma, coeff, srng)
-            samp_phase = tensor.mod(samp_phase + np.pi, 2 * np.pi) - np.pi
-            samp = s * samp_mag + (1 - s) * samp_phase
-            return samp, v_h1_t
-
-        init_corr_out = tensor.zeros((out_t.shape[1], n_density))
-        init_samp_out = tensor.zeros((out_t.shape[1], 1))
-        r, isupdates = theano.scan(
+        # vertical scan
+        init_v_out = tensor.zeros((out_t.shape[1], n_v_hid))
+        v_out_t, updates = theano.scan(
             fn=sample_out_step,
-            sequences=[counter, out_t],
-            outputs_info=[init_samp_out, init_corr_out])
-        corr_out_t = r[0]
-        x_t = corr_out_t.dimshuffle(2, 1, 0)[0]
-        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
+            sequences=[out_t],
+            outputs_info=[init_v_out])
+
+        corr_out_t = v_out_t.dot(v_outs_to_corr_outs)
+        corr_out_t = corr_out_t[:, :, 0].dimshuffle(1, 0)
+        corr_out_t = corr_out_t.dot(corr_outs_to_final_outs)
+
+        split = corr_out_t.shape[-1] // 2
+        mag_out_t = corr_out_t[:, :split]
+        phase_out_t = corr_out_t[:, split:]
+        mu_mag, sigma_mag, coeff_mag = _slice_outs(mag_out_t)
+        mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_out_t)
+        s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng)
+        s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng)
+        """
+        # Set sample to debug in order to check test values
+        s_mag = sample_diagonal_gmm(mu_mag, sigma_mag, coeff_mag, srng,
+                                    debug=True)
+        s_phase = sample_diagonal_gmm(mu_phase, sigma_phase, coeff_phase, srng,
+                                      debug=True)
+        """
+        s_phase = tensor.mod(s_phase + np.pi, 2 * np.pi) - np.pi
+        x_t = tensor.concatenate([s_mag, s_phase], axis=-1)
+        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
 
 
-    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, supdates) = sample_step(
-        init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
-
-    """
-    # Old multistep code which doesn't work with updates in the internal scan
     n_steps_sym = tensor.iscalar()
     n_steps_sym.tag.test_value = 10
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h), supdates = theano.scan(
@@ -469,8 +443,17 @@ if __name__ == "__main__":
         outputs_info=[init_x, init_h1, init_h2, init_h3,
                       init_kappa, init_w, None, None],
         non_sequences=[context])
-    """
 
+    """
+    # Testing step function
+    r = step(inp_h1[0], inpgate_h1[0], inp_h2[0], inpgate_h2[0],
+             inp_h3[0], inpgate_h3[0],
+             init_h1, init_h2, init_h3, init_kappa, init_w, context)
+
+    r = step(inp_h1[1], inpgate_h1[1], inp_h2[1], inpgate_h2[1],
+             inp_h3[1], inpgate_h3[1],
+             r[0], r[1], r[2], r[3], r[4], context)
+    """
     (h1, h2, h3, kappa, w), updates = theano.scan(
         fn=step,
         sequences=[inp_h1, inpgate_h1,
@@ -483,30 +466,29 @@ if __name__ == "__main__":
 
     orig_shapes = outs.shape
     outs = outs.dimshuffle(2, 1, 0)
+    # pre project? cutting down to 1 dim really hurts
     outs = outs.reshape((orig_shapes[2], orig_shapes[1] * orig_shapes[0], 1))
 
-    shuff_inpt_shapes = inpt.shape
-    shuff_inpt = inpt.dimshuffle(2, 1, 0)
-    shuff_inpt = shuff_inpt.reshape((shuff_inpt_shapes[2],
-                                     shuff_inpt_shapes[1] * shuff_inpt_shapes[0],
-                                     1))
-
-    def out_step(x_tm1, o_tm1, v_h1_tm1):
-        j_tm1 = tensor.concatenate((x_tm1, o_tm1), axis=1)
-        vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(j_tm1)
+    def out_step(x_tm1, v_h1_tm1):
+        vinp_h1_t, vgate_h1_t = inp_to_v_h1.proj(x_tm1)
         v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
         return v_h1_t
 
-    init_corr_outs = tensor.zeros((outs.shape[1], n_density))
-    corr_outs, updates = theano.scan(
+    init_v_outs = tensor.zeros((outs.shape[1], n_v_hid))
+    v_outs, updates = theano.scan(
         fn=out_step,
-        sequences=[shuff_inpt, outs],
-        outputs_info=[init_corr_outs])
-    corr_outs = corr_outs.dimshuffle(1, 0, 2)
+        sequences=[outs],
+        outputs_info=[init_v_outs])
 
-    split = corr_outs.shape[1] // 2
-    mag_outs = corr_outs[:, :split]
-    phase_outs = corr_outs[:, split:]
+    corr_outs = v_outs.dot(v_outs_to_corr_outs)
+    corr_outs = corr_outs[:, :, 0].reshape((orig_shapes[2], orig_shapes[1],
+                                            orig_shapes[0]))
+    corr_outs = corr_outs.dimshuffle(2, 1, 0)
+    corr_outs = corr_outs.dot(corr_outs_to_final_outs)
+
+    split = corr_outs.shape[-1] // 2
+    mag_outs = corr_outs[:, :, :split]
+    phase_outs = corr_outs[:, :, split:]
 
     mu_mag, sigma_mag, coeff_mag = _slice_outs(mag_outs)
     mu_phase, sigma_phase, coeff_phase = _slice_outs(phase_outs)
@@ -515,11 +497,10 @@ if __name__ == "__main__":
     mag_target = target[:, :, :target_split]
     phase_target = target[:, :, target_split:]
 
-    mag_cost = single_dimensional_gmms(
+    mag_cost = diagonal_gmm(
         mag_target, mu_mag, sigma_mag, coeff_mag)
-    phase_cost = single_dimensional_phase_gmms(
+    phase_cost = diagonal_phase_gmm(
         phase_target, mu_phase, sigma_phase, coeff_phase)
-
     cost = mag_cost + phase_cost
 
     cost = cost * mask
@@ -527,7 +508,7 @@ if __name__ == "__main__":
     grads = tensor.grad(cost, params)
     grads = gradient_clipping(grads, 10.)
 
-    learning_rate = 1E-4
+    learning_rate = 1E-3
 
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
@@ -551,11 +532,11 @@ if __name__ == "__main__":
                                           init_w],
                                          [kappa, w], on_unused_input='warn')
     sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
-                                       init_h3, init_kappa, init_w, bias_sym],
+                                       init_h3, init_kappa, init_w, bias_sym,
+                                       n_steps_sym],
                                       [sampled, h1_s, h2_s, h3_s, k_s, w_s,
                                        stop_s, stop_h],
-                                      updates=supdates,
-                                      on_unused_input='warn')
+                                      updates=supdates)
 
     checkpoint_dict = {}
     checkpoint_dict["train_function"] = train_function
@@ -635,6 +616,9 @@ if __name__ == "__main__":
                 if train_mb_count % monitor_frequency == 0:
                     print("starting train mb %i" % train_mb_count)
                     print("current epoch mean cost %f" % np.mean(train_costs))
+	        if np.isnan(train_costs[-1]) or np.isinf(train_costs[-1]):
+		    print("Invalid cost detected at epoch %i" % e)
+		    raise ValueError("Exiting...")
                 train_mb_count += 1
         except StopIteration:
             valid_costs = []
@@ -650,21 +634,13 @@ if __name__ == "__main__":
             except StopIteration:
                 pass
             mean_epoch_train_cost = np.mean(train_costs)
-            if np.isnan(overall_train_costs[-1]) or np.isinf(
-                overall_train_costs[-1]):
-                print("Invalid cost detected at epoch %i" % e)
-                raise ValueError("Exiting...")
             mean_epoch_valid_cost = np.mean(valid_costs)
             overall_train_costs.append(mean_epoch_train_cost)
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
-<<<<<<< Updated upstream
             script = os.path.realpath(__file__)
-            print("Script %s" % script)
-=======
-            print("script %s" % os.path.realpath(__file__))
->>>>>>> Stashed changes
+            print("script %s" % script)
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)

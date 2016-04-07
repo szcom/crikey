@@ -508,7 +508,7 @@ if __name__ == "__main__":
     grads = tensor.grad(cost, params)
     grads = gradient_clipping(grads, 10.)
 
-    learning_rate = 1E-4
+    learning_rate = 1E-3
 
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
@@ -631,11 +631,16 @@ if __name__ == "__main__":
             except StopIteration:
                 pass
             mean_epoch_train_cost = np.mean(train_costs)
+            if np.isnan(overall_train_costs[-1]) or np.isinf(
+                overall_train_costs[-1]):
+                print("Invalid cost detected at epoch %i" % e)
+                raise ValueError("Exiting...")
             mean_epoch_valid_cost = np.mean(valid_costs)
             overall_train_costs.append(mean_epoch_train_cost)
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
+            print("script %s" % os.path.realpath(__file__))
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)

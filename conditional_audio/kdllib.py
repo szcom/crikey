@@ -7,6 +7,7 @@ from scipy import linalg, fftpack
 from scipy.cluster.vq import vq
 from scipy.io import wavfile
 import scipy.signal as sg
+import wave
 import tarfile
 import os
 import glob
@@ -343,6 +344,77 @@ def fetch_sample_speech_tapestry():
     d = d.astype('float32') / (2 ** 15)
     # file is stereo? - just choose one channel
     return fs, d
+
+
+def _wav2array(nchannels, sampwidth, data):
+    # wavio.py
+    # Author: Warren Weckesser
+    # License: BSD 3-Clause (http://opensource.org/licenses/BSD-3-Clause)
+
+    """data must be the string containing the bytes from the wav file."""
+    num_samples, remainder = divmod(len(data), sampwidth * nchannels)
+    if remainder > 0:
+        raise ValueError('The length of data is not a multiple of '
+                         'sampwidth * num_channels.')
+    if sampwidth > 4:
+        raise ValueError("sampwidth must not be greater than 4.")
+
+    if sampwidth == 3:
+        a = np.empty((num_samples, nchannels, 4), dtype=np.uint8)
+        raw_bytes = np.fromstring(data, dtype=np.uint8)
+        a[:, :, :sampwidth] = raw_bytes.reshape(-1, nchannels, sampwidth)
+        a[:, :, sampwidth:] = (a[:, :, sampwidth - 1:sampwidth] >> 7) * 255
+        result = a.view('<i4').reshape(a.shape[:-1])
+    else:
+        # 8 bit samples are stored as unsigned ints; others as signed ints.
+        dt_char = 'u' if sampwidth == 1 else 'i'
+        a = np.fromstring(data, dtype='<%s%d' % (dt_char, sampwidth))
+        result = a.reshape(-1, nchannels)
+    return result
+
+
+def readwav(file):
+    # wavio.py
+    # Author: Warren Weckesser
+    # License: BSD 3-Clause (http://opensource.org/licenses/BSD-3-Clause)
+    """
+    Read a wav file.
+
+    Returns the frame rate, sample width (in bytes) and a numpy array
+    containing the data.
+
+    This function does not read compressed wav files.
+    """
+    wav = wave.open(file)
+    rate = wav.getframerate()
+    nchannels = wav.getnchannels()
+    sampwidth = wav.getsampwidth()
+    nframes = wav.getnframes()
+    data = wav.readframes(nframes)
+    wav.close()
+    array = _wav2array(nchannels, sampwidth, data)
+    return rate, sampwidth, array
+
+
+def fetch_sample_speech_ono(n_samples=None):
+    datapath = os.path.join("ono_wav", "*wav")
+    wav_names = glob.glob(datapath)
+    wav_names = [w for w in wav_names
+                 if "EKENWAY" in w]
+    wav_names = [w for w in wav_names
+                 if "PAIN" in w]
+
+    speech = []
+    print("Loading speech files...")
+    for wav_name in wav_names[:n_samples]:
+        fs, bitw, d = readwav(wav_name)
+        # 24 bit but only 16 used???
+        d = d.astype('float32') / (2 ** 15)
+        d = sg.decimate(d, 6, ftype="fir")[::6]
+        # decimate to 8k
+        fs = 8000
+        speech.append(d)
+    return fs, speech, wav_names
 
 
 def complex_to_real_view(arr_c):
@@ -1594,6 +1666,115 @@ def fetch_fruitspeech_nonpar():
     return speech
 
 
+def fetch_ono():
+    fs, d, wav_names = fetch_sample_speech_ono()
+    # Force 1D
+    d = [di.squeeze() for di in d]
+    def matcher(name):
+        return name.split("PAIN")[1].split("_")[1]
+
+    classes = [matcher(wav_name) for wav_name in wav_names]
+    low = ["L1", "L2", "L3"]
+    uw = ["U1", "U2", "U3", "UF"]
+    high = ["L4", "L5", "SA"]
+    final_classes = []
+    for c in classes:
+        if c in low:
+            final_classes.append("low")
+        elif c in high:
+            final_classes.append("hi")
+        elif c in uw:
+            final_classes.append("uw")
+        else:
+            raise ValueError("Unknown class %s" % c)
+        
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    n_fft = 128
+    n_step = n_fft // 4
+
+    def _pre(x):
+        X_stft = stft(x, n_fft, step=n_step)
+        # Power spectrum
+        X_mag = complex_to_abs(X_stft)
+        X_mag = np.log10(X_mag + 1E-9)
+        # unwrap phase then take delta
+        X_phase = complex_to_angle(X_stft)
+        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
+        # Adding zeros to make network predict what *delta* in phase makes sense
+        X_phase_unwrap = np.unwrap(X_phase, axis=0)
+        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
+        X_mag_phase = np.hstack((X_mag, X_phase_delta))
+        return X_mag_phase
+
+    X = [_pre(di) for di in d]
+
+    X_len = np.sum([len(Xi) for Xi in X])
+    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
+    X_mean = X_sum / X_len
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
+
+    def scale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = (_x - _mean) / _var
+        return x
+
+    def unscale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = _x * _var + _mean
+        return x
+
+    X = [scale(Xi) for Xi in X]
+
+    def _re(x):
+        X_mag_phase = unscale(x)
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_mag = 10 ** X_mag
+        X_phase_delta = X_mag_phase[:, n_fft // 2:]
+        # Append leading 0s for consistency
+        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
+                                   X_phase_delta))
+        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
+        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
+        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
+        return X_r
+
+    """
+    for n, Xi in enumerate(X[:10]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
+
+
 def plot_lines_iamondb_example(X, title="", save_name=None):
     import matplotlib.pyplot as plt
     f, ax = plt.subplots()
@@ -2120,4 +2301,5 @@ def run_blizzard_example():
 if __name__ == "__main__":
     #run_fft_dct_example()
     #run_lpc_example()
-    run_blizzard_example()
+    #run_blizzard_example()
+    fetch_ono()

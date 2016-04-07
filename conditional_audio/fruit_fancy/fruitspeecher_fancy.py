@@ -650,21 +650,13 @@ if __name__ == "__main__":
             except StopIteration:
                 pass
             mean_epoch_train_cost = np.mean(train_costs)
-            if np.isnan(overall_train_costs[-1]) or np.isinf(
-                overall_train_costs[-1]):
-                print("Invalid cost detected at epoch %i" % e)
-                raise ValueError("Exiting...")
             mean_epoch_valid_cost = np.mean(valid_costs)
             overall_train_costs.append(mean_epoch_train_cost)
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
-<<<<<<< Updated upstream
             script = os.path.realpath(__file__)
             print("Script %s" % script)
-=======
-            print("script %s" % os.path.realpath(__file__))
->>>>>>> Stashed changes
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)
