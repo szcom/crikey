@@ -6,7 +6,7 @@ from scipy.io import wavfile
 import os
 import sys
 from kdllib import load_checkpoint, dense_to_one_hot, plot_lines_iamondb_example
-from kdllib import fetch_ono, list_iterator, np_zeros, GRU, GRUFork
+from kdllib import fetch_walla, list_iterator, np_zeros, GRU, GRUFork
 from kdllib import make_weights, as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import save_checkpoint, save_weights, sample_diagonal_gmm
@@ -16,15 +16,15 @@ from kdllib import diagonal_gmm, diagonal_phase_gmm, soundsc
 if __name__ == "__main__":
     import argparse
 
-    speech = fetch_ono()
+    speech = fetch_walla()
     X = speech["data"]
     y = speech["target"]
     vocabulary = speech["vocabulary"]
     vocabulary_size = speech["vocabulary_size"]
     reconstruct = speech["reconstruct"]
     fs = speech["sample_rate"]
-    X = np.array([x.astype(theano.config.floatX) for x in X])
-    y = np.array([yy.astype(theano.config.floatX) for yy in y])
+    X = [x.astype(theano.config.floatX) for x in X]
+    y = [yy.astype(theano.config.floatX) for yy in y]
     
 
     minibatch_size = 20
@@ -34,9 +34,9 @@ if __name__ == "__main__":
     cut_len = 41  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
-    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=40,
+    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=100,
                               randomize=True, make_mask=True)
-    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=40,
+    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=100,
                               make_mask=True)
 
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)

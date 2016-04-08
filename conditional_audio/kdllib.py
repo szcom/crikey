@@ -417,6 +417,30 @@ def fetch_sample_speech_ono(n_samples=None):
     return fs, speech, wav_names
 
 
+def fetch_sample_speech_walla(n_samples=None):
+    datapath = os.path.join("walla_wav", "*wav")
+    names = glob.glob(datapath)
+
+    speech = []
+    wav_names = []
+ 
+    print("Loading speech files...")
+    for name in names[:n_samples]:
+        fs, bitw, d = readwav(name)
+        d = d.astype('float32') / (2 ** 15)
+        inds = np.arange(0, len(d), 16000)
+        for i, j in zip(inds[:-1], inds[1:]):
+            dij = d[i:j]
+            dij = sg.decimate(dij, 2, ftype="iir")[::2]
+            # decimate to 8k
+            fs = 8000
+            speech.append(dij)
+            wav_names.append(name)
+        if len(speech) > 200:
+           break
+    return fs, speech, wav_names
+
+
 def complex_to_real_view(arr_c):
     # Inplace view from complex to r, i as separate columns
     assert arr_c.dtype in [np.complex64, np.complex128]
@@ -1365,7 +1389,11 @@ class base_iterator(object):
 
 class list_iterator(base_iterator):
     def _slice_without_masks(self, ind):
-        sliced_c = [np.asarray(c[ind]) for c in self.list_of_containers]
+        sliced_c = []
+        for c in self.list_of_containers:
+            slc = c[ind]
+            arr = np.asarray(slc)
+            sliced_c.append(arr)
         if min([len(i) for i in sliced_c]) < self.minibatch_size:
             self.reset()
             raise StopIteration("Invalid length slice")
@@ -1396,6 +1424,10 @@ class list_iterator(base_iterator):
                     for m, sc_i in enumerate(sc):
                         new_sc[:len(sc_i), m, :] = sc_i
                 sliced_c[n] = new_sc
+            else:
+                # Hit this case if all sequences are the same length
+                if self.axis == 1:
+                    sliced_c[n] = sc.transpose(1, 0, 2)
         return sliced_c
 
     def _slice_with_masks(self, ind):
@@ -1688,6 +1720,98 @@ def fetch_ono():
         else:
             raise ValueError("Unknown class %s" % c)
     classes = final_classes
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    n_fft = 128
+    n_step = n_fft // 4
+
+    def _pre(x):
+        X_stft = stft(x, n_fft, step=n_step)
+        # Power spectrum
+        X_mag = complex_to_abs(X_stft)
+        X_mag = np.log10(X_mag + 1E-9)
+        # unwrap phase then take delta
+        X_phase = complex_to_angle(X_stft)
+        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
+        # Adding zeros to make network predict what *delta* in phase makes sense
+        X_phase_unwrap = np.unwrap(X_phase, axis=0)
+        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
+        X_mag_phase = np.hstack((X_mag, X_phase_delta))
+        return X_mag_phase
+
+    X = [_pre(di) for di in d]
+
+    X_len = np.sum([len(Xi) for Xi in X])
+    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
+    X_mean = X_sum / X_len
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
+
+    def scale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = (_x - _mean) / _var
+        return x
+
+    def unscale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = _x * _var + _mean
+        return x
+
+    X = [scale(Xi) for Xi in X]
+
+    def _re(x):
+        X_mag_phase = unscale(x)
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_mag = 10 ** X_mag
+        X_phase_delta = X_mag_phase[:, n_fft // 2:]
+        # Append leading 0s for consistency
+        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
+                                   X_phase_delta))
+        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
+        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
+        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
+        return X_r
+
+    """
+    for n, Xi in enumerate(X[:10]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
+
+
+def fetch_walla():
+    fs, d, wav_names = fetch_sample_speech_walla()
+    # Force 1D
+    d = [di.squeeze() for di in d]
+    classes = ["ab" for wav_name in wav_names]
     all_chars = [c for c in sorted(list(set("".join(classes))))]
     char2code = {v: k for k, v in enumerate(all_chars)}
     vocabulary_size = len(char2code.keys())
@@ -2302,4 +2426,5 @@ if __name__ == "__main__":
     #run_fft_dct_example()
     #run_lpc_example()
     #run_blizzard_example()
-    fetch_ono()
+    #fetch_ono()
+    fetch_walla()
