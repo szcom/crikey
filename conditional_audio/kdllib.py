@@ -423,7 +423,7 @@ def fetch_sample_speech_walla(n_samples=None):
 
     speech = []
     wav_names = []
- 
+
     print("Loading speech files...")
     for name in names[:n_samples]:
         fs, bitw, d = readwav(name)
@@ -1162,6 +1162,55 @@ def lpc_analysis(X, order=8, window_step=128, window_size=2 * 128,
     return lp_coefficients, per_frame_gain, residual_excitation
 
 
+def lpc_to_frequency(lp_coefficients, per_frame_gain):
+    """
+    Extract resonant frequencies and magnitudes from LPC coefficients and gains.
+    Parameters
+    ----------
+    lp_coefficients : ndarray
+        LPC coefficients, such as those calculated by ``lpc_analysis``
+
+    per_frame_gain : ndarray
+       Gain calculated for each frame, such as those calculated
+       by ``lpc_analysis``
+
+    Returns
+    -------
+    frequencies : ndarray
+       Resonant frequencies calculated from LPC coefficients and gain. Returned
+       frequencies are from 0 to 2 * pi
+
+    magnitudes : ndarray
+       Magnitudes of resonant frequencies
+
+    References
+    ----------
+    D. P. W. Ellis (2004), "Sinewave Speech Analysis/Synthesis in Matlab",
+    Web resource, available: http://www.ee.columbia.edu/ln/labrosa/matlab/sws/
+    """
+    n_windows, order = lp_coefficients.shape
+
+    frame_frequencies = np.zeros((n_windows, (order - 1) // 2))
+    frame_magnitudes = np.zeros_like(frame_frequencies)
+
+    for window in range(n_windows):
+        w_coefs = lp_coefficients[window]
+        g_coefs = per_frame_gain[window]
+        roots = np.roots(np.hstack(([1], w_coefs[1:])))
+        # Roots doesn't return the same thing as MATLAB... agh
+        frequencies, index = np.unique(
+            np.abs(np.angle(roots)), return_index=True)
+        # Make sure 0 doesn't show up...
+        gtz = np.where(frequencies > 0)[0]
+        frequencies = frequencies[gtz]
+        index = index[gtz]
+        magnitudes = g_coefs / (1. - np.abs(roots))
+        sort_index = np.argsort(frequencies)
+        frame_frequencies[window, :len(sort_index)] = frequencies[sort_index]
+        frame_magnitudes[window, :len(sort_index)] = magnitudes[sort_index]
+    return frame_frequencies, frame_magnitudes
+
+
 def lpc_synthesis(lp_coefficients, per_frame_gain, residual_excitation=None,
                   voiced_frames=None, window_step=128, emphasis=0.9):
     """
@@ -1465,6 +1514,148 @@ def tokenize_ind(phrase, vocabulary):
     phrase = np.array(phrase, dtype='int32').ravel()
     phrase = dense_to_one_hot(phrase, vocabulary_size)
     return phrase
+
+
+def apply_stft_preproc(X, n_fft=128, n_step_frac=4):
+    n_step = n_fft // n_step_frac
+
+    def _pre(x):
+        X_stft = stft(x, n_fft, step=n_step)
+        # Power spectrum
+        X_mag = complex_to_abs(X_stft)
+        X_mag = np.log10(X_mag + 1E-9)
+        # unwrap phase then take delta
+        X_phase = complex_to_angle(X_stft)
+        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
+        # Adding zeros to make network predict what *delta* in phase makes sense
+        X_phase_unwrap = np.unwrap(X_phase, axis=0)
+        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
+        X_mag_phase = np.hstack((X_mag, X_phase_delta))
+        return X_mag_phase
+
+    X = [_pre(Xi) for Xi in X]
+
+    X_len = np.sum([len(Xi) for Xi in X])
+    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
+    X_mean = X_sum / X_len
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
+
+    def scale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = (_x - _mean) / _var
+        return x
+
+    def unscale(x):
+        # WARNING: OPERATES IN PLACE!!!
+        # Can only realistically scale magnitude...
+        # Phase cost depends on circularity
+        x = np.copy(x)
+        _x = x[:, :n_fft // 2]
+        _mean = X_mean[None, :n_fft // 2]
+        _var = X_var[None, :n_fft // 2]
+        x[:, :n_fft // 2] = _x * _var + _mean
+        return x
+
+    X = [scale(Xi) for Xi in X]
+
+    def _re(x):
+        X_mag_phase = unscale(x)
+        X_mag = X_mag_phase[:, :n_fft // 2]
+        X_mag = 10 ** X_mag
+        X_phase_delta = X_mag_phase[:, n_fft // 2:]
+        # Append leading 0s for consistency
+        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
+                                   X_phase_delta))
+        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
+        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
+        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
+        return X_r
+    return X, _re
+
+
+def apply_lpc_softmax_preproc(X, fs=8000):
+    # 256 @ 8khz - .032
+    ws = 2 ** int(np.log(0.032 * fs) / np.log(2))
+    window_size = ws
+    window_step = int(.2 * window_size)
+    lpc_order = 30
+    def _pre(x):
+        a, g, e = lpc_analysis(x, order=lpc_order, window_step=window_step,
+                               window_size=window_size, emphasis=0.9,
+                               copy=True)
+        f_sub = np.hstack((a, g))
+        v, p = voiced_unvoiced(x, window_size=window_size,
+                               window_step=window_step)
+        cut_len = e.shape[0] - e.shape[0] % len(a)
+        e = e[:cut_len]
+        e = e.reshape((len(a), -1))
+        f_full = np.hstack((a, g, v, e))
+        return f_sub, f_full
+
+    def _re_sub(sub):
+        a = sub[:, :lpc_order + 1]
+        offset = lpc_order + 1
+        g = sub[:, offset:]
+        x_r = lpc_synthesis(a, g, emphasis=0.9,
+                            window_step=window_step)
+        agc_x_r, _, _ = time_attack_agc(x_r, fs)
+        return agc_x_r
+
+    def _re_full(full):
+        a = full[:, :lpc_order + 1]
+        offset = lpc_order + 1
+        g = full[:, offset:offset + 1]
+        offset = offset + 1
+        v = full[:, offset:offset + 1]
+        offset = offset + 1
+        e = full[:, offset:].ravel()
+        x_r = lpc_synthesis(a, g, e, voiced_frames=v,
+                            emphasis=0.9, window_step=window_step)
+        agc_x_r, _, _ = time_attack_agc(x_r, fs)
+        return agc_x_r
+
+    X = [_pre(Xi)[0] for Xi in X]
+    return X, _re_sub
+
+
+def fetch_fruitspeech_softmax():
+    fs, d, wav_names = fetch_sample_speech_fruit()
+    def matcher(name):
+        return name.split("/")[1]
+
+    classes = [matcher(wav_name) for wav_name in wav_names]
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    X, _re = apply_lpc_softmax_preproc(d)
+
+    """
+    for n, Xi in enumerate(X[::8]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
 
 
 def fetch_fruitspeech():
