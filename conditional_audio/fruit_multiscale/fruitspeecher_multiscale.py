@@ -1,7 +1,8 @@
 import numpy as np
 import theano
 import theano.tensor as tensor
-from theano.tensor.nnet import conv2d
+#from theano.tensor.nnet import conv2d
+from theano.tensor.nnet.conv import conv2d
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from scipy.io import wavfile
 import os
@@ -13,7 +14,6 @@ from kdllib import make_weights, as_shared, adam, gradient_clipping, theano_one_
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import save_checkpoint, save_weights, sample_single_dimensional_gmms
 from kdllib import single_dimensional_gmms, single_dimensional_phase_gmms, soundsc
-
 
 if __name__ == "__main__":
     import argparse
@@ -278,12 +278,14 @@ if __name__ == "__main__":
     params += [h1_to_outs, h2_to_outs]
 
     # n_kernels in output tup is an arbitrary number
-    w_deconv1, = make_conv_weights(n_kernels, (1,),
+    w_deconv1, = make_conv_weights(1, (n_kernels,),
                                    (deconv_size1, input_dim + 1),
                                    random_state)
     w_deconv2, = make_conv_weights(n_kernels, (n_kernels,),
                                  (deconv_size2, input_dim + 1), random_state)
-    params += [w_deconv1, w_deconv2]
+    w_deconv3, = make_conv_weights(n_kernels, (n_kernels,),
+                                 (deconv_size2, input_dim + 1), random_state)
+    params += [w_deconv1, w_deconv2, w_deconv3]
 
     w_blurconv, = make_conv_weights(n_kernels, (n_kernels,),
                                    (2 + 1, input_dim + 1),
@@ -316,10 +318,12 @@ if __name__ == "__main__":
     inpt = inpt.dimshuffle(1, 'x', 0, 2)
 
     border_mode = (conv_size1 - 1, 0)
+    border_mode = "valid"
     conv1 = conv2d(inpt, w_conv1, subsample=(2, 1), border_mode=border_mode)
     theano.printing.Print("conv1.shape")(conv1.shape)
 
     border_mode = (conv_size2 - 1, 0)
+    border_mode = "valid"
     conv2 = conv2d(conv1, w_conv2, subsample=(2, 1), border_mode=border_mode)
     theano.printing.Print("conv2.shape")(conv2.shape)
 
@@ -381,30 +385,44 @@ if __name__ == "__main__":
     outs = outs.dimshuffle(1, 'x', 0 , 2)
     theano.printing.Print("outs.shape")(outs.shape)
 
+    def _slice_mid(cmap):
+        return cmap[:, :, :, input_dim // 4:input_dim // 4 + input_dim + 1]
+
     border_mode = (0, input_dim // 2)
-    deconv1 = conv2d_transpose(outs, w_deconv1,
-                               border_mode=border_mode)
+    border_mode = "full"
+    deconv1 = conv2d(outs, w_deconv1, border_mode=border_mode)
+    deconv1 = _slice_mid(deconv1)
     theano.printing.Print("w_deconv1.shape")(w_deconv1.shape)
     theano.printing.Print("deconv1.shape")(deconv1.shape)
 
     depool1 = unpool(deconv1, pool_size=(2, 1))
     theano.printing.Print("depool1.shape")(depool1.shape)
 
-    deconv2 = conv2d_transpose(depool1, w_deconv2, border_mode=border_mode)
+    deconv2 = conv2d(depool1, w_deconv2, border_mode=border_mode)
+    deconv2 = _slice_mid(deconv2)
     theano.printing.Print("w_deconv2.shape")(w_deconv2.shape)
     theano.printing.Print("deconv2.shape")(deconv2.shape)
 
-    sliced = deconv2[:, :, :target.shape[0], :]
+    depool2 = unpool(deconv2, pool_size=(2, 1))
+    deconv3 = conv2d(depool2, w_deconv3, border_mode=border_mode)
+    deconv3 = _slice_mid(deconv3)
+    sliced = deconv3[:, :, :target.shape[0], :]
     theano.printing.Print("sliced.shape")(sliced.shape)
 
-    blur_conv = conv2d(sliced, w_blurconv, border_mode="half")
+    border_mode = "half"
+    border_mode = (sliced.shape[2] // 2, input_dim // 2)
+    border_mode = "full"
+    blur_conv = conv2d(sliced, w_blurconv, border_mode=border_mode)
+    blur_conv = _slice_mid(blur_conv)
     theano.printing.Print("w_blurconv.shape")(w_blurconv.shape)
     theano.printing.Print("blur_conv.shape")(blur_conv.shape)
-    final_conv = conv2d(blur_conv, w_finalconv, border_mode="half")
+    final_conv = conv2d(blur_conv, w_finalconv, border_mode=border_mode)
+    final_conv = _slice_mid(final_conv) # slice back to correct
     theano.printing.Print("w_finalconv.shape")(w_finalconv.shape)
     theano.printing.Print("final_conv.shape")(final_conv.shape)
-    outs_deconv = final_conv[:, :, :, :input_dim] # slice back to correct
+    outs_deconv = final_conv[:, :, :, :input_dim]
     outs_deconv = outs_deconv.dimshuffle(2, 0, 3, 1)
+    outs_deconv = outs_deconv[:target.shape[0]]
     theano.printing.Print("outs_deconv.shape")(outs_deconv.shape)
     preds = softmax(outs_deconv + b_softmax)
     theano.printing.Print("preds.shape")(preds.shape)
@@ -421,6 +439,7 @@ if __name__ == "__main__":
     init_x = as_shared(np_zeros((minibatch_size, n_out)))
     srng = RandomStreams(1999)
 
+    """
     # Used to calculate stopping heuristic from sections 5.3
     u_max = 0. * tensor.arange(c_sym.shape[0]) + c_sym.shape[0]
     u_max = u_max.dimshuffle('x', 'x', 0)
@@ -448,7 +467,6 @@ if __name__ == "__main__":
         coeff = coeff.reshape(coeff_orig_shape)
         return mu, sigma, coeff
 
-    """
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1, k_tm1, w_tm1, ctx):
         xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
         xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1)
@@ -638,12 +656,11 @@ if __name__ == "__main__":
                             c_mb, c_mb_mask,
                             prev_h1, prev_h2, prev_kappa, prev_w)
             current_cost = rval[0]
-            prev_h1, prev_h2, prev_h3 = rval[1:4]
+            prev_h1, prev_h2 = rval[1:3]
             prev_h1 = prev_h1[-1]
             prev_h2 = prev_h2[-1]
-            prev_h3 = prev_h3[-1]
-            prev_kappa = rval[4][-1]
-            prev_w = rval[5][-1]
+            prev_kappa = rval[3][-1]
+            prev_w = rval[4][-1]
         partial_costs.append(current_cost)
         return partial_costs
 

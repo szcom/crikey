@@ -39,6 +39,8 @@ def unpool(input, pool_size=(1, 1)):
 
 
 def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
+    # No worky
+    raise ValueError("BUGS")
     return conv2d_grad_wrt_inputs(
             output_grad=input,
             filters=filters,
@@ -3002,7 +3004,8 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
         The cost per sample, or per sample per step if 3D
 
     """
-    indices = tensor.argmax(true_values, axis=true_values.ndim - 1)
+    tv = true_values.reshape((-1, true_values.shape[-1]))
+    indices = tensor.argmax(tv, axis=-1)
     rows = tensor.arange(true_values.shape[0])
     if eps > 0:
         p = tensor.cast(predicted_values, theano.config.floatX) + eps
@@ -3014,7 +3017,7 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
     elif predicted_values.ndim >= 3:
         shp = predicted_values.shape
         pred = p.reshape((-1, shp[-1]))
-        ind = indices.flatten()
+        ind = indices.reshape((-1,))
         s = tensor.arange(pred.shape[0])
         correct = -tensor.log(pred)[s, ind]
         return correct.reshape(shp[:-1])
