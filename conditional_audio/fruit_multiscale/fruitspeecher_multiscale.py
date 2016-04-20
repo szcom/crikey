@@ -44,7 +44,7 @@ if __name__ == "__main__":
 
     input_dim = X_mb.shape[-1]
     n_bins = 10
-    n_kernels = 2
+    n_kernels = 64
     conv_size1 = 11
     conv_size2 = 5
     deconv_size1 = 5
