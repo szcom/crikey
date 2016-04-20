@@ -11,8 +11,7 @@ from kdllib import load_checkpoint, dense_to_one_hot, categorical_crossentropy
 from kdllib import fetch_fruitspeech_spectrogram, list_iterator, np_zeros, GRU, GRUFork
 from kdllib import make_weights, as_shared, adam, gradient_clipping, theano_one_hot
 from kdllib import get_values_from_function, set_shared_variables_in_function
-from kdllib import save_checkpoint, save_weights, sample_single_dimensional_gmms
-from kdllib import single_dimensional_gmms, single_dimensional_phase_gmms, soundsc
+from kdllib import save_checkpoint, save_weights, relu, tanh, soundsc
 
 if __name__ == "__main__":
     import argparse
@@ -44,7 +43,7 @@ if __name__ == "__main__":
 
     input_dim = X_mb.shape[-1]
     n_bins = 10
-    n_kernels = 64
+    n_kernels = 32
     conv_size1 = 11
     conv_size2 = 5
     deconv_size1 = 5
@@ -242,9 +241,11 @@ if __name__ == "__main__":
     params = []
     w_conv1, = make_conv_weights(1, (n_kernels,), (conv_size1, input_dim),
                                  random_state)
+    b_conv1, = make_biases((n_kernels,), conv=True)
     w_conv2, = make_conv_weights(n_kernels, (n_kernels,),
                                  (conv_size2, 1), random_state)
-    params += [w_conv1, w_conv2]
+    b_conv2, = make_biases((n_kernels,), conv=True)
+    params += [w_conv1, b_conv1, w_conv2, b_conv2]
 
     # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
     conv_to_h1 = GRUFork(n_kernels, n_hid, random_state)
@@ -280,11 +281,14 @@ if __name__ == "__main__":
     w_deconv1, = make_conv_weights(1, (n_kernels,),
                                    (deconv_size1, input_dim + 1),
                                    random_state)
+    b_deconv1, = make_biases((n_kernels,), conv=True)
     w_deconv2, = make_conv_weights(n_kernels, (n_kernels,),
                                  (deconv_size2, input_dim + 1), random_state)
+    b_deconv2, = make_biases((n_kernels,), conv=True)
     w_deconv3, = make_conv_weights(n_kernels, (n_kernels,),
                                  (deconv_size2, input_dim + 1), random_state)
-    params += [w_deconv1, w_deconv2, w_deconv3]
+    b_deconv3, = make_biases((n_kernels,), conv=True)
+    params += [w_deconv1, b_deconv1, w_deconv2, b_deconv2, w_deconv3, b_deconv3]
 
     w_blurconv, = make_conv_weights(n_kernels, (n_kernels,),
                                    (2 + 1, input_dim + 1),
@@ -317,13 +321,13 @@ if __name__ == "__main__":
     inpt = inpt.dimshuffle(1, 'x', 0, 2)
 
     border_mode = (conv_size1 - 1, 0)
-    border_mode = "valid"
     conv1 = conv2d(inpt, w_conv1, subsample=(2, 1), border_mode=border_mode)
+    conv1 = conv1 + b_conv1.dimshuffle('x', 0, 'x', 'x')
     theano.printing.Print("conv1.shape")(conv1.shape)
 
     border_mode = (conv_size2 - 1, 0)
-    border_mode = "valid"
     conv2 = conv2d(conv1, w_conv2, subsample=(2, 1), border_mode=border_mode)
+    conv2 = relu(conv2 + b_conv2.dimshuffle('x', 0, 'x', 'x'))
     theano.printing.Print("conv2.shape")(conv2.shape)
 
     # Last axis is 1
@@ -390,6 +394,7 @@ if __name__ == "__main__":
     border_mode = "full"
     deconv1 = conv2d(outs, w_deconv1, border_mode=border_mode)
     deconv1 = _slice_mid(deconv1)
+    deconv1 = tanh(deconv1 + b_deconv1.dimshuffle('x', 0, 'x', 'x'))
     theano.printing.Print("w_deconv1.shape")(w_deconv1.shape)
     theano.printing.Print("deconv1.shape")(deconv1.shape)
 
@@ -398,12 +403,14 @@ if __name__ == "__main__":
 
     deconv2 = conv2d(depool1, w_deconv2, border_mode=border_mode)
     deconv2 = _slice_mid(deconv2)
+    deconv2 = tanh(deconv2 + b_deconv2.dimshuffle('x', 0, 'x', 'x'))
     theano.printing.Print("w_deconv2.shape")(w_deconv2.shape)
     theano.printing.Print("deconv2.shape")(deconv2.shape)
 
     depool2 = unpool(deconv2, pool_size=(2, 1))
     deconv3 = conv2d(depool2, w_deconv3, border_mode=border_mode)
     deconv3 = _slice_mid(deconv3)
+    deconv3 = tanh(deconv3 + b_deconv3.dimshuffle('x', 0, 'x', 'x'))
     sliced = deconv3[:, :, :target.shape[0], :]
     theano.printing.Print("sliced.shape")(sliced.shape)
 
@@ -657,15 +664,11 @@ if __name__ == "__main__":
             print("Continuing anyways - statistics may not be correct!")
 
     def _loop(function, itr):
-        prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
-                                     for i in range(3)]
+        prev_h1, prev_h2 = [np_zeros((minibatch_size, n_hid))
+                                     for i in range(2)]
         prev_kappa = np_zeros((minibatch_size, att_size))
         prev_w = np_zeros((minibatch_size, n_chars))
         X_mb, X_mb_mask, c_mb, c_mb_mask = next(itr)
-        print(X_mb.shape)
-        print(X_mb_mask.shape)
-        print(c_mb.shape)
-        print(c_mb_mask.shape)
         n_cuts = len(X_mb) // cut_len + 1
         partial_costs = []
         for n in range(n_cuts):

@@ -2874,9 +2874,12 @@ def apply_shared(list_of_numpy):
     return [as_shared(arr) for arr in list_of_numpy]
 
 
-def make_biases(bias_dims, ndim=1):
-    return apply_shared([np_zeros((1,) * (ndim - 1) + (dim,))
-                         for dim in bias_dims])
+def make_biases(bias_dims, conv=False):
+    if conv is True:
+        res = apply_shared([np_zeros((dim,))
+                            for dim in bias_dims])
+        return res
+    return apply_shared([np_zeros((dim,)) for dim in bias_dims])
 
 
 def make_weights(in_dim, out_dims, random_state):
@@ -2963,6 +2966,14 @@ def softmax(X):
     e_X = tensor.exp(X - X.max(axis=dim - 1, keepdims=True))
     out = e_X / e_X.sum(axis=dim - 1, keepdims=True)
     return out
+
+
+def relu(x):
+    return x * (x > 1e-6)
+
+
+def tanh(x):
+    return tensor.tanh(x)
 
 
 def theano_one_hot(t, r=None):
