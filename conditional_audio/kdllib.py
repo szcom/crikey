@@ -39,8 +39,8 @@ def unpool(input, pool_size=(1, 1)):
 
 
 def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
-    # No worky
-    raise ValueError("BUGS")
+    # swap to in dim out dim to make life easier
+    filters = filters.transpose(1, 0, 2, 3)
     return conv2d_grad_wrt_inputs(
             output_grad=input,
             filters=filters,

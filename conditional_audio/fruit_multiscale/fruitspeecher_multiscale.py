@@ -1,8 +1,7 @@
 import numpy as np
 import theano
 import theano.tensor as tensor
-#from theano.tensor.nnet import conv2d
-from theano.tensor.nnet.conv import conv2d
+from theano.tensor.nnet import conv2d
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from scipy.io import wavfile
 import os
@@ -31,8 +30,8 @@ if __name__ == "__main__":
     minibatch_size = 20
     n_epochs = 20000  # Used way at the bottom in the training loop!
     checkpoint_every_n = 500
-    # Was 300
-    cut_len = 41  # Used way at the bottom in the training loop!
+    # Was 300 for handwriting
+    cut_len = 31  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
@@ -388,7 +387,6 @@ if __name__ == "__main__":
     def _slice_mid(cmap):
         return cmap[:, :, :, input_dim // 4:input_dim // 4 + input_dim + 1]
 
-    border_mode = (0, input_dim // 2)
     border_mode = "full"
     deconv1 = conv2d(outs, w_deconv1, border_mode=border_mode)
     deconv1 = _slice_mid(deconv1)
@@ -409,17 +407,46 @@ if __name__ == "__main__":
     sliced = deconv3[:, :, :target.shape[0], :]
     theano.printing.Print("sliced.shape")(sliced.shape)
 
-    border_mode = "half"
-    border_mode = (sliced.shape[2] // 2, input_dim // 2)
     border_mode = "full"
     blur_conv = conv2d(sliced, w_blurconv, border_mode=border_mode)
     blur_conv = _slice_mid(blur_conv)
     theano.printing.Print("w_blurconv.shape")(w_blurconv.shape)
     theano.printing.Print("blur_conv.shape")(blur_conv.shape)
     final_conv = conv2d(blur_conv, w_finalconv, border_mode=border_mode)
-    final_conv = _slice_mid(final_conv) # slice back to correct
+    final_conv = _slice_mid(final_conv)
     theano.printing.Print("w_finalconv.shape")(w_finalconv.shape)
     theano.printing.Print("final_conv.shape")(final_conv.shape)
+
+
+    """
+    # conv2d_transpose not working :( some strange bug only after optimization
+    border_mode = (0, input_dim // 2)
+    deconv1 = conv2d_transpose(outs, w_deconv1, border_mode=border_mode)
+    theano.printing.Print("w_deconv1.shape")(w_deconv1.shape)
+    theano.printing.Print("deconv1.shape")(deconv1.shape)
+
+    depool1 = unpool(deconv1, pool_size=(2, 1))
+    theano.printing.Print("depool1.shape")(depool1.shape)
+
+    deconv2 = conv2d_transpose(depool1, w_deconv2, border_mode=border_mode)
+    theano.printing.Print("w_deconv2.shape")(w_deconv2.shape)
+    theano.printing.Print("deconv2.shape")(deconv2.shape)
+
+    depool2 = unpool(deconv2, pool_size=(2, 1))
+    theano.printing.Print("depool2.shape")(depool2.shape)
+    deconv3 = conv2d(depool2, w_deconv3, border_mode=border_mode)
+    sliced = deconv3
+    theano.printing.Print("sliced.shape")(sliced.shape)
+
+    border_mode = "half"
+    blur_conv = conv2d(sliced, w_blurconv, border_mode=border_mode)
+    theano.printing.Print("w_blurconv.shape")(w_blurconv.shape)
+    theano.printing.Print("blur_conv.shape")(blur_conv.shape)
+    final_conv = conv2d(blur_conv, w_finalconv, border_mode=border_mode)
+    theano.printing.Print("w_finalconv.shape")(w_finalconv.shape)
+    theano.printing.Print("final_conv.shape")(final_conv.shape)
+    """
+
     outs_deconv = final_conv[:, :, :, :input_dim]
     outs_deconv = outs_deconv.dimshuffle(2, 0, 3, 1)
     outs_deconv = outs_deconv[:target.shape[0]]
@@ -635,6 +662,10 @@ if __name__ == "__main__":
         prev_kappa = np_zeros((minibatch_size, att_size))
         prev_w = np_zeros((minibatch_size, n_chars))
         X_mb, X_mb_mask, c_mb, c_mb_mask = next(itr)
+        print(X_mb.shape)
+        print(X_mb_mask.shape)
+        print(c_mb.shape)
+        print(c_mb_mask.shape)
         n_cuts = len(X_mb) // cut_len + 1
         partial_costs = []
         for n in range(n_cuts):
