@@ -4,9 +4,10 @@
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
 from scipy import linalg, fftpack
-from scipy.cluster.vq import vq
+from scipy.cluster.vq import kmeans, vq
 from scipy.io import wavfile
 import scipy.signal as sg
+from collections import Iterable
 import wave
 import tarfile
 import os
@@ -25,11 +26,58 @@ except ImportError:
 import threading
 import theano
 import theano.tensor as tensor
+from theano.tensor.nnet.abstract_conv import conv2d_grad_wrt_inputs
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 try:
     import urllib.request as urllib  # for backwards compatibility
 except ImportError:
     import urllib2 as urllib
+
+
+def unpool(input, pool_size=(1, 1)):
+    return input.repeat(pool_size[0], axis=2).repeat(pool_size[1], axis=3)
+
+
+def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
+    return conv2d_grad_wrt_inputs(
+            output_grad=input,
+            filters=filters,
+            input_shape=(None, None, input.shape[2], input.shape[3]),
+            border_mode=border_mode,
+            subsample=stride,
+            filter_flip=True)
+
+
+def t_conv_out_size(input_size, filter_size, stride, pad):
+    # Author: Francesco Visin
+    """Computes the length of the output of a transposed convolution
+    Parameters
+    ----------
+    input_size : int, Iterable or Theano tensor
+        The size of the input of the transposed convolution
+    filter_size : int, Iterable or Theano tensor
+        The size of the filter
+    stride : int, Iterable or Theano tensor
+        The stride of the transposed convolution
+    pad : int, Iterable, Theano tensor or string
+        The padding of the transposed convolution
+    """
+    if input_size is None:
+        return None
+    input_size = np.array(input_size)
+    filter_size = np.array(filter_size)
+    stride = np.array(stride)
+    if isinstance(pad, (int, Iterable)) and not isinstance(pad, str):
+        pad = np.array(pad)
+        output_size = (input_size - 1) * stride + filter_size - 2*pad
+
+    elif pad == 'full':
+        output_size = input_size * stride - filter_size - stride + 2
+    elif pad == 'valid':
+        output_size = (input_size - 1) * stride + filter_size
+    elif pad == 'same':
+        output_size = input_size
+    return output_size
 
 
 def soundsc(X, copy=True):
@@ -97,8 +145,6 @@ def download(url, server_fname, local_fname=None, progress_update_percentage=5,
                                                100. / file_size)
                 print(status)
                 p += progress_update_percentage
-
-
 
 
 class BlizzardThread(threading.Thread):
@@ -1211,6 +1257,63 @@ def lpc_to_frequency(lp_coefficients, per_frame_gain):
     return frame_frequencies, frame_magnitudes
 
 
+def lpc_to_lsf(all_lpc):
+    if len(all_lpc.shape) < 2:
+        all_lpc = all_lpc[None]
+    order = all_lpc.shape[1] - 1
+    all_lsf = np.zeros((len(all_lpc), order))
+    for i in range(len(all_lpc)):
+        lpc = all_lpc[i]
+        lpc1 = np.append(lpc, 0)
+        lpc2 = lpc1[::-1]
+        sum_filt = lpc1 + lpc2
+        diff_filt = lpc1 - lpc2
+
+        if order % 2 != 0:
+            deconv_diff, _ = sg.deconvolve(diff_filt, [1, 0, -1])
+            deconv_sum = sum_filt
+        else:
+            deconv_diff, _ = sg.deconvolve(diff_filt, [1, -1])
+            deconv_sum, _ = sg.deconvolve(sum_filt, [1, 1])
+
+        roots_diff = np.roots(deconv_diff)
+        roots_sum = np.roots(deconv_sum)
+        angle_diff = np.angle(roots_diff[::2])
+        angle_sum = np.angle(roots_sum[::2])
+        lsf = np.sort(np.hstack((angle_diff, angle_sum)))
+        if len(lsf) != 0:
+            all_lsf[i] = lsf
+    return np.squeeze(all_lsf)
+
+
+def lsf_to_lpc(all_lsf):
+    if len(all_lsf.shape) < 2:
+        all_lsf = all_lsf[None]
+    order = all_lsf.shape[1]
+    all_lpc = np.zeros((len(all_lsf), order + 1))
+    for i in range(len(all_lsf)):
+        lsf = all_lsf[i]
+        zeros = np.exp(1j * lsf)
+        sum_zeros = zeros[::2]
+        diff_zeros = zeros[1::2]
+        sum_zeros = np.hstack((sum_zeros, np.conj(sum_zeros)))
+        diff_zeros = np.hstack((diff_zeros, np.conj(diff_zeros)))
+        sum_filt = np.poly(sum_zeros)
+        diff_filt = np.poly(diff_zeros)
+
+        if order % 2 != 0:
+            deconv_diff = sg.convolve(diff_filt, [1, 0, -1])
+            deconv_sum = sum_filt
+        else:
+            deconv_diff = sg.convolve(diff_filt, [1, -1])
+            deconv_sum = sg.convolve(sum_filt, [1, 1])
+
+        lpc = .5 * (deconv_sum + deconv_diff)
+        # Last coefficient is 0 and not returned
+        all_lpc[i] = lpc[:-1]
+    return np.squeeze(all_lpc)
+
+
 def lpc_synthesis(lp_coefficients, per_frame_gain, residual_excitation=None,
                   voiced_frames=None, window_step=128, emphasis=0.9):
     """
@@ -1268,7 +1371,7 @@ def lpc_synthesis(lp_coefficients, per_frame_gain, residual_excitation=None,
     if residual_excitation is None:
         # Need to generate excitation
         if voiced_frames is None:
-            # No voiced/unvoiced info, so just use randn
+            # No voiced/unvoiced info
             voiced_frames = np.ones((lp_coefficients.shape[0], 1))
         residual_excitation = np.zeros((n_excitation_points))
         f, m = lpc_to_frequency(lp_coefficients, per_frame_gain)
@@ -1580,16 +1683,75 @@ def apply_stft_preproc(X, n_fft=128, n_step_frac=4):
     return X, _re
 
 
+def apply_spectrogram_preproc(X, n_fft=512, n_step_frac=10):
+    n_step = n_fft // n_step_frac
+
+    def _pre(x):
+        X_mag = np.abs(stft(x, n_fft, step=n_step))
+        X_mag = np.log10(X_mag + 1E-9)
+        return X_mag
+
+    X = [_pre(Xi) for Xi in X]
+
+    X_len = np.sum([len(Xi) for Xi in X])
+    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
+    X_mean = X_sum / X_len
+    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
+                    for Xi in X], axis=0) / X_len
+    X_max = np.max([np.max(Xi) for Xi in X])
+    X_min = np.min([np.min(Xi) for Xi in X])
+
+    def scale(x):
+        x = (x - X_min) / (X_max - X_min)
+        return x
+
+    def unscale(x):
+        x = x * (X_max - X_min) + X_min
+        return x
+
+    n_bins = 10
+    # Extra n because bin is reserved kwd in Python
+    bins = np.linspace(0, 1, n_bins)
+    def binn(x):
+        shp = x.shape
+        bins = np.linspace(0, 1, n_bins)
+        return np.digitize(x.ravel(), bins).reshape(shp)
+
+    def unbin(x):
+        return x / float(n_bins)
+
+    X = [scale(Xi) for Xi in X]
+    X = [binn(Xi) for Xi in X]
+
+    """
+    import matplotlib.pyplot as plt
+    plt.matshow(X[0][::-1, ::-1].T)
+    plt.matshow(unbin(X[0])[::-1, ::-1].T)
+    from IPython import embed; embed()
+    raise ValueError()
+    """
+
+    def _re(x):
+        X_ub = unbin(x)
+        X_mag = unscale(X_ub)
+        X_mag = 10 ** X_mag
+        X_s = np.hstack((X_mag, X_mag[:, ::-1]))
+        X_r = iterate_invert_spectrogram(X_s, n_fft, n_step)
+        return X_r
+    return X, _re
+
+
 def apply_lpc_softmax_preproc(X, fs=8000):
     # 256 @ 8khz - .032
     ws = 2 ** int(np.log(0.032 * fs) / np.log(2))
     window_size = ws
     window_step = int(.2 * window_size)
-    lpc_order = 30
+    lpc_order = 12
     def _pre(x):
         a, g, e = lpc_analysis(x, order=lpc_order, window_step=window_step,
                                window_size=window_size, emphasis=0.9,
                                copy=True)
+        a = lpc_to_lsf(a)
         f_sub = np.hstack((a, g))
         v, p = voiced_unvoiced(x, window_size=window_size,
                                window_step=window_step)
@@ -1599,18 +1761,56 @@ def apply_lpc_softmax_preproc(X, fs=8000):
         f_full = np.hstack((a, g, v, e))
         return f_sub, f_full
 
+    X = [_pre(Xi)[0] for Xi in X]
+    X_stack = np.vstack(X)
+    kmeans_results = []
+    random_state = np.random.RandomState(1999)
+    n_clust = 60
+    for dim in range(X_stack.shape[1]):
+        print("Processing dim %i of %i" % (dim + 1, X_stack.shape[1]))
+        # Assume some clusters will die
+        res = kmeans(X_stack[:, dim], n_clust * 2)
+        sub = list(range(len(res[0])))
+        random_state.shuffle(sub)
+        assert len(sub) > n_clust
+        kmeans_results.append(res[0][sub[:n_clust]])
+
+    def _vq(Xi):
+        Xi2 = Xi.copy()
+        for dim in range(X_stack.shape[1]):
+            idx, _ = vq(Xi[:, dim], kmeans_results[dim])
+            Xi2[:, dim] = idx
+        return Xi2
+
+    def _unvq(Xi):
+        """
+        assumes vq indices have been cast to float32
+        """
+        Xi2 = Xi.copy()
+        for dim in range(X_stack.shape[1]):
+            Xi2[:, dim] = kmeans_results[dim][Xi[:, dim].astype("int32")]
+        return Xi2
+
+    X = [_vq(Xi) for Xi in X]
+
+    def _apply(Xi):
+        return _vq(_pre(Xi)[0])
+
     def _re_sub(sub):
-        a = sub[:, :lpc_order + 1]
-        offset = lpc_order + 1
-        g = sub[:, offset:]
+        sub = _unvq(sub)
+        a = sub[:, :-1]
+        a = lsf_to_lpc(a)
+        g = sub[:, -1:]
         x_r = lpc_synthesis(a, g, emphasis=0.9,
                             window_step=window_step)
         agc_x_r, _, _ = time_attack_agc(x_r, fs)
         return agc_x_r
 
     def _re_full(full):
-        a = full[:, :lpc_order + 1]
-        offset = lpc_order + 1
+        raise ValueError("NYI")
+        a = full[:, :lpc_order]
+        a = np.hstack(np.ones_like(a[:, 0]), a)
+        offset = lpc_order
         g = full[:, offset:offset + 1]
         offset = offset + 1
         v = full[:, offset:offset + 1]
@@ -1621,8 +1821,7 @@ def apply_lpc_softmax_preproc(X, fs=8000):
         agc_x_r, _, _ = time_attack_agc(x_r, fs)
         return agc_x_r
 
-    X = [_pre(Xi)[0] for Xi in X]
-    return X, _re_sub
+    return X, _apply, _re_sub
 
 
 def fetch_fruitspeech_softmax():
@@ -1638,7 +1837,41 @@ def fetch_fruitspeech_softmax():
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
-    X, _re = apply_lpc_softmax_preproc(d)
+    # Is it kosher to kmeans on all the data?
+    X, _apply, _re = apply_lpc_softmax_preproc(d)
+
+    """
+    for n, Xi in enumerate(X[::8]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
+
+
+def fetch_fruitspeech_spectrogram():
+    fs, d, wav_names = fetch_sample_speech_fruit()
+    def matcher(name):
+        return name.split("/")[1]
+
+    classes = [matcher(wav_name) for wav_name in wav_names]
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    X, _re = apply_spectrogram_preproc(d)
 
     """
     for n, Xi in enumerate(X[::8]):
@@ -2147,10 +2380,95 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 
 def np_zeros(shape):
+    """
+    Builds a numpy variable filled with zeros
+
+    Parameters
+    ----------
+    shape, tuple of ints
+        shape of zeros to initialize
+
+    Returns
+    -------
+    initialized_zeros, array-like
+        Array-like of zeros the same size as shape parameter
+    """
     return np.zeros(shape).astype(theano.config.floatX)
 
 
+def np_ones(shape):
+    """
+    Builds a numpy variable filled with ones
+
+    Parameters
+    ----------
+    shape, tuple of ints
+        shape of ones to initialize
+
+    Returns
+    -------
+    initialized_ones, array-like
+        Array-like of ones the same size as shape parameter
+    """
+    return np.ones(shape).astype(theano.config.floatX)
+
+
+def np_uniform(shape, random_state, scale=0.08):
+    """
+    Builds a numpy variable filled with uniform random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 0.08)
+        scale to apply to uniform random values from (-1, 1)
+        default of 0.08 results in uniform random values in (-0.08, 0.08)
+
+    Returns
+    -------
+    initialized_uniform, array-like
+        Array-like of uniform random values the same size as shape parameter
+    """
+    if type(shape[0]) is tuple:
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+    else:
+        shp = shape
+    # Make sure bounds aren't the same
+    return random_state.uniform(low=-scale, high=scale, size=shp).astype(
+        theano.config.floatX)
+
+
 def np_normal(shape, random_state, scale=0.01):
+    """
+    Builds a numpy variable filled with normal random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 0.01)
+        default of 0.01 results in normal random values with variance 0.01
+
+    Returns
+    -------
+    initialized_normal, array-like
+        Array-like of normal random values the same size as shape parameter
+    """
     if type(shape[0]) is tuple:
         shp = (shape[1][0], shape[0][0]) + shape[1][1:]
     else:
@@ -2158,7 +2476,343 @@ def np_normal(shape, random_state, scale=0.01):
     return (scale * random_state.randn(*shp)).astype(theano.config.floatX)
 
 
+def np_tanh_fan_uniform(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in normal uniform random values
+        with sqrt(6 / (fan in + fan out)) scale
+
+    Returns
+    -------
+    initialized_fan, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Understanding the difficulty of training deep feedforward neural networks
+        X. Glorot, Y. Bengio
+    """
+    if type(shape[0]) is tuple:
+        kern_sum = np.prod(shape[0]) + np.prod(shape[1])
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+    else:
+        kern_sum = np.sum(shape)
+        shp = shape
+    # The . after the 6 is critical! shape has dtype int...
+    bound = scale * np.sqrt(6. / kern_sum)
+    return random_state.uniform(low=-bound, high=bound,
+                                size=shp).astype(theano.config.floatX)
+
+
+def np_tanh_fan_normal(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in normal random values
+        with sqrt(2 / (fan in + fan out)) scale
+
+    Returns
+    -------
+    initialized_fan, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Understanding the difficulty of training deep feedforward neural networks
+        X. Glorot, Y. Bengio
+    """
+    # The . after the 2 is critical! shape has dtype int...
+    if type(shape[0]) is tuple:
+        kern_sum = np.prod(shape[0]) + np.prod(shape[1])
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+    else:
+        kern_sum = np.sum(shape)
+        shp = shape
+    var = scale * np.sqrt(2. / kern_sum)
+    return var * random_state.randn(*shp).astype(theano.config.floatX)
+
+
+def np_sigmoid_fan_uniform(shape, random_state, scale=4.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 4.)
+        default of 4. results in uniform random values
+        with 4 * sqrt(6 / (fan in + fan out)) scale
+
+    Returns
+    -------
+    initialized_fan, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Understanding the difficulty of training deep feedforward neural networks
+        X. Glorot, Y. Bengio
+    """
+    return scale * np_tanh_fan_uniform(shape, random_state)
+
+
+def np_sigmoid_fan_normal(shape, random_state, scale=4.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 4.)
+        default of 4. results in normal random values
+        with 4 * sqrt(2 / (fan in + fan out)) scale
+
+    Returns
+    -------
+    initialized_fan, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Understanding the difficulty of training deep feedforward neural networks
+        X. Glorot, Y. Bengio
+    """
+    return scale * np_tanh_fan_normal(shape, random_state)
+
+
+def np_variance_scaled_uniform(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in uniform random values
+        with 1 * sqrt(1 / (n_dims)) scale
+
+    Returns
+    -------
+    initialized_scaled, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Efficient Backprop
+        Y. LeCun, L. Bottou, G. Orr, K. Muller
+
+    """
+    if type(shape[0]) is tuple:
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+        kern_sum = np.prod(shape[0])
+    else:
+        shp = shape
+        kern_sum = shape[0]
+    #  Make sure bounds aren't the same
+    bound = scale * np.sqrt(3. / kern_sum)  # sqrt(3) for std of uniform
+    return random_state.uniform(low=-bound, high=bound, size=shp).astype(
+        theano.config.floatX)
+
+
+def np_variance_scaled_randn(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in normal random values
+        with 1 * sqrt(1 / (n_dims)) scale
+
+    Returns
+    -------
+    initialized_scaled, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Efficient Backprop
+        Y. LeCun, L. Bottou, G. Orr, K. Muller
+    """
+    if type(shape[0]) is tuple:
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+        kern_sum = np.prod(shape[0])
+    else:
+        shp = shape
+        kern_sum = shape[0]
+    # Make sure bounds aren't the same
+    std = scale * np.sqrt(1. / kern_sum)
+    return std * random_state.randn(*shp).astype(theano.config.floatX)
+
+
+def np_deep_scaled_uniform(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in uniform random values
+        with 1 * sqrt(6 / (n_dims)) scale
+
+    Returns
+    -------
+    initialized_deep, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Diving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet
+        K. He, X. Zhang, S. Ren, J. Sun
+    """
+    if type(shape[0]) is tuple:
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+        kern_sum = np.prod(shape[0])
+    else:
+        shp = shape
+        kern_sum = shape[0]
+    #  Make sure bounds aren't the same
+    bound = scale * np.sqrt(6. / kern_sum)  # sqrt(3) for std of uniform
+    return random_state.uniform(low=-bound, high=bound, size=shp).astype(
+        theano.config.floatX)
+
+
+def np_deep_scaled_normal(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in normal random values
+        with 1 * sqrt(2 / (n_dims)) scale
+
+    Returns
+    -------
+    initialized_deep, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Diving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet
+        K. He, X. Zhang, S. Ren, J. Sun
+    """
+    if type(shape[0]) is tuple:
+        shp = (shape[1][0], shape[0][0]) + shape[1][1:]
+        kern_sum = np.prod(shape[0])
+    else:
+        shp = shape
+        kern_sum = shape[0]
+    # Make sure bounds aren't the same
+    std = scale * np.sqrt(2. / kern_sum)  # sqrt(3) for std of uniform
+    return std * random_state.randn(*shp).astype(theano.config.floatX)
+
+
 def np_ortho(shape, random_state, scale=1.):
+    """
+    Builds a numpy variable filled with orthonormal random values
+
+    Parameters
+    ----------
+    shape, tuple of ints or tuple of tuples
+        shape of values to initialize
+        tuple of ints should be single shape
+        tuple of tuples is primarily for convnets and should be of form
+        ((n_in_kernels, kernel_width, kernel_height),
+         (n_out_kernels, kernel_width, kernel_height))
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 1.)
+        default of 1. results in orthonormal random values sacled by 1.
+
+    Returns
+    -------
+    initialized_ortho, array-like
+        Array-like of random values the same size as shape parameter
+
+    References
+    ----------
+    Exact solutions to the nonlinear dynamics of learning in deep linear
+    neural networks
+        A. Saxe, J. McClelland, S. Ganguli
+    """
     if type(shape[0]) is tuple:
         shp = (shape[1][0], shape[0][0]) + shape[1][1:]
         flat_shp = (shp[0], np.prd(shp[1:]))
@@ -2169,6 +2823,35 @@ def np_ortho(shape, random_state, scale=1.):
     U, S, VT = linalg.svd(g, full_matrices=False)
     res = U if U.shape == flat_shp else VT  # pick one with the correct shape
     res = res.reshape(shp)
+    return (scale * res).astype(theano.config.floatX)
+
+
+def np_identity(shape, random_state, scale=0.98):
+    """
+    Identity initialization for square matrices
+
+    Parameters
+    ----------
+    shape, tuple of ints
+        shape of resulting array - shape[0] and shape[1] must match
+
+    random_state, numpy.random.RandomState() object
+
+    scale, float (default 0.98)
+        default of .98 results in .98 * eye initialization
+
+    Returns
+    -------
+    initialized_identity, array-like
+        identity initialized square matrix same size as shape
+
+    References
+    ----------
+    A Simple Way To Initialize Recurrent Networks of Rectified Linear Units
+        Q. Le, N. Jaitly, G. Hinton
+    """
+    assert shape[0] == shape[1]
+    res = np.eye(shape[0])
     return (scale * res).astype(theano.config.floatX)
 
 
@@ -2189,8 +2872,20 @@ def apply_shared(list_of_numpy):
     return [as_shared(arr) for arr in list_of_numpy]
 
 
+def make_biases(bias_dims, ndim=1):
+    return apply_shared([np_zeros((1,) * (ndim - 1) + (dim,))
+                         for dim in bias_dims])
+
+
 def make_weights(in_dim, out_dims, random_state):
     return apply_shared([np_normal((in_dim, out_dim), random_state)
+                         for out_dim in out_dims])
+
+
+def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
+    return apply_shared([np_tanh_fan_normal(
+        ((in_dim, kernel_size[0], kernel_size[1]),
+         (out_dim, kernel_size[0], kernel_size[1])), random_state)
                          for out_dim in out_dims])
 
 
@@ -2293,7 +2988,7 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
     ----------
     predicted_values : tensor, shape 2D or 3D
         The predicted class probabilities out of some layer,
-        normally the output of softmax_layer
+        normally the output of a softmax
 
     true_values : tensor, shape 2D or 3D
         Ground truth one hot values
@@ -2307,7 +3002,7 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
         The cost per sample, or per sample per step if 3D
 
     """
-    indices = tensor.argmax(true_values, axis=-1)
+    indices = tensor.argmax(true_values, axis=true_values.ndim - 1)
     rows = tensor.arange(true_values.shape[0])
     if eps > 0:
         p = tensor.cast(predicted_values, theano.config.floatX) + eps
@@ -2316,16 +3011,13 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
         p = tensor.cast(predicted_values, theano.config.floatX)
     if predicted_values.ndim < 3:
         return -tensor.log(p)[rows, indices]
-    elif predicted_values.ndim == 3:
-        d0 = true_values.shape[0]
-        d1 = true_values.shape[1]
-        pred = p.reshape((d0 * d1, -1))
-        ind = indices.reshape((d0 * d1,))
+    elif predicted_values.ndim >= 3:
+        shp = predicted_values.shape
+        pred = p.reshape((-1, shp[-1]))
+        ind = indices.flatten()
         s = tensor.arange(pred.shape[0])
         correct = -tensor.log(pred)[s, ind]
-        return correct.reshape((d0, d1,))
-    else:
-        raise AttributeError("Tensor dim not supported")
+        return correct.reshape(shp[:-1])
 
 
 def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5,
