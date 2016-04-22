@@ -1716,10 +1716,10 @@ def apply_spectrogram_preproc(X, n_fft=512, n_step_frac=10):
     bins = np.linspace(0, 1, n_bins)
     def binn(x):
         shp = x.shape
-        bins = np.linspace(0, 1, n_bins)
-        return np.digitize(x.ravel(), bins).reshape(shp)
+        return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
 
     def unbin(x):
+        # use middle instead of left edge?
         return x / float(n_bins)
 
     X = [scale(Xi) for Xi in X]
@@ -2874,20 +2874,37 @@ def apply_shared(list_of_numpy):
     return [as_shared(arr) for arr in list_of_numpy]
 
 
-def make_biases(bias_dims, conv=False):
-    if conv is True:
-        res = apply_shared([np_zeros((dim,))
-                            for dim in bias_dims])
-        return res
+def make_biases(bias_dims):
+    """
+    Will return as many things as are in the list of out_dims
+    You *must* get a list back, even for 1 element returned!
+    blah, = make_biases(...)
+    or
+    [blah] = make_biases(...)
+    """
     return apply_shared([np_zeros((dim,)) for dim in bias_dims])
 
 
 def make_weights(in_dim, out_dims, random_state):
+    """
+    Will return as many things as are in the list of out_dims
+    You *must* get a list back, even for 1 element returned!
+    blah, = make_weights(...)
+    or
+    [blah] = make_weights(...)
+    """
     return apply_shared([np_normal((in_dim, out_dim), random_state)
                          for out_dim in out_dims])
 
 
 def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
+    """
+    Will return as many things as are in the list of out_dims
+    You *must* get a list back, even for 1 element returned!
+    blah, = make_conv_weights(...)
+    or
+    [blah] = make_conv_weights(...)
+    """
     return apply_shared([np_tanh_fan_normal(
         ((in_dim, kernel_size[0], kernel_size[1]),
          (out_dim, kernel_size[0], kernel_size[1])), random_state)
@@ -2983,13 +3000,15 @@ def theano_one_hot(t, r=None):
     return tensor.eq(ranges, tensor.shape_padright(t, 1))
 
 
-def sample_softmax(coeff, theano_rng, epsilon=1E-5):
+def sample_softmax(coeff, theano_rng, epsilon=1E-5, debug=False):
     if coeff.ndim > 2:
         raise ValueError("Unsupported dim")
-    idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
-                        axis=1)
-    return tensor.cast(theano_one_hot(idx, coeff.shape[1]),
-                       theano.config.floatX)
+    if debug:
+        idx = coeff.argmax(axis=1)
+    else:
+        idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
+                            axis=1)
+    return tensor.cast(idx, theano.config.floatX)
 
 
 def categorical_crossentropy(predicted_values, true_values, eps=0.):
