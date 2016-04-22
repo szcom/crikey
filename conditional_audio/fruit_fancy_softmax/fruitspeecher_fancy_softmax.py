@@ -30,9 +30,9 @@ if __name__ == "__main__":
 
     minibatch_size = 20
     n_epochs = 20000  # Used way at the bottom in the training loop!
-    checkpoint_every_n = 500
+    checkpoint_every_n = 100
     # Was 300
-    cut_len = 41  # Used way at the bottom in the training loop!
+    cut_len = 31  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
@@ -44,8 +44,8 @@ if __name__ == "__main__":
     train_itr.reset()
 
     input_dim = X_mb.shape[-1]
-    n_hid = 400
-    n_proj = 100
+    n_hid = 256
+    n_proj = 64
     att_size = 10
     n_components = 3
     n_out = X_mb.shape[-1]
@@ -125,7 +125,7 @@ if __name__ == "__main__":
                                      for i in range(3)]
         prev_kappa = np_zeros((minibatch_size, att_size))
         prev_w = np_zeros((minibatch_size, n_chars))
-        bias = args.bias
+        softmax_bias = args.bias
         if args.sample is not None:
             predict_function = checkpoint_dict["predict_function"]
             attention_function = checkpoint_dict["attention_function"]
@@ -183,7 +183,8 @@ if __name__ == "__main__":
                 completed = []
                 for i in range(fixed_steps):
                     rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                            prev_h3, prev_kappa, prev_w, bias)
+                                            prev_h3, prev_kappa, prev_w,
+                                            softmax_bias)
                     sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
                     completed.append(sampled)
                     prev_h1 = h1_s
@@ -217,8 +218,6 @@ if __name__ == "__main__":
     c_sym.tag.test_value = c_mb
     c_mask_sym = tensor.matrix("c_mask_sym")
     c_mask_sym.tag.test_value = c_mb_mask
-    att_bias_sym = tensor.scalar("att_bias_sym")
-    att_bias_sym.tag.test_value = 0.
     softmax_bias_sym = tensor.scalar("softmax_bias_sym")
     softmax_bias_sym.tag.test_value = 0.
 
@@ -517,7 +516,7 @@ if __name__ == "__main__":
                                           init_w],
                                          [kappa, w], on_unused_input='warn')
     sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
-                                       init_h3, init_kappa, init_w, att_bias_sym, softmax_bias_sym],
+                                       init_h3, init_kappa, init_w, softmax_bias_sym],
                                       [sampled, h1_s, h2_s, h3_s, k_s, w_s,
                                        stop_s, stop_h],
                                       updates=supdates,
