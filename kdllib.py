@@ -2,6 +2,7 @@
 # Authors: Kyle Kastner
 
 import numpy as np
+import uuid
 from numpy.lib.stride_tricks import as_strided
 from scipy import linalg, fftpack
 from scipy.cluster.vq import kmeans, vq
@@ -3336,6 +3337,61 @@ def run_blizzard_example():
     import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
     raise ValueError()
 
+
+def run_loop(loop_function, train_function, train_itr,
+             valid_function, valid_itr, n_epochs, checkpoint_dict,
+             checkpoint_every_n=100, start_epoch=0, monitor_frequency=1000):
+    """
+    loop function should return a list of costs
+    """
+    overall_train_costs = []
+    overall_valid_costs = []
+    _loop = loop_function
+    ident = str(uuid.uuid4())[:8]
+    train_mb_count = 0
+    valid_mb_count = 0
+    for e in range(start_epoch, start_epoch + n_epochs):
+        train_costs = []
+        try:
+            while True:
+                partial_train_costs = _loop(train_function, train_itr)
+                train_costs.append(np.mean(partial_train_costs))
+                if train_mb_count % monitor_frequency == 0:
+                    print("starting train mb %i" % train_mb_count)
+                    print("current epoch mean cost %f" % np.mean(train_costs))
+                train_mb_count += 1
+        except StopIteration:
+            valid_costs = []
+            try:
+                while True:
+                    partial_valid_costs = _loop(valid_function, valid_itr)
+                    valid_costs.append(np.mean(partial_valid_costs))
+                    if valid_mb_count % monitor_frequency == 0:
+                        print("starting valid mb %i" % valid_mb_count)
+                        print("current validation mean cost %f" % np.mean(
+                            valid_costs))
+                    valid_mb_count += 1
+            except StopIteration:
+                pass
+            mean_epoch_train_cost = np.mean(train_costs)
+            mean_epoch_valid_cost = np.mean(valid_costs)
+            overall_train_costs.append(mean_epoch_train_cost)
+            overall_valid_costs.append(mean_epoch_valid_cost)
+            checkpoint_dict["overall_train_costs"] = overall_train_costs
+            checkpoint_dict["overall_valid_costs"] = overall_valid_costs
+            script = os.path.realpath(__file__)
+            print("Script %s" % script)
+            print("epoch %i complete" % e)
+            print("epoch mean train cost %f" % mean_epoch_train_cost)
+            print("epoch mean valid cost %f" % mean_epoch_valid_cost)
+            print("overall train costs %s" % overall_train_costs[-5:])
+            print("overall valid costs %s" % overall_valid_costs[-5:])
+            if ((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
+                print("Checkpointing...")
+                checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
+                weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
+                save_checkpoint(checkpoint_save_path, checkpoint_dict)
+                save_weights(weights_save_path, checkpoint_dict)
 
 
 if __name__ == "__main__":
