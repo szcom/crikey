@@ -12,6 +12,10 @@ from theano.tensor.shared_randomstreams import RandomStreams
 from kdllib import gradient_clipping, make_weights, make_biases
 from kdllib import sgd, adadelta, adam
 from kdllib import fetch_fruitspeech_spectrogram
+from kdllib import midiwrap, fetch_nottingham
+import cPickle as pickle
+
+midiread, midiwrite = midiwrap()
 
 #Don't use a python long as this don't work on 32 bits computers.
 np.random.seed(0xbeef)
@@ -225,18 +229,19 @@ class LstmRbm:
                                            n_hidden_recurrent)
 
         grads = tensor.grad(cost, params, consider_constant=[v_sample])
+        """
         opt = sgd(params, lr)
+        """
 
         """
         opt = adadelta(params)
         grads = gradient_clipping(grads, 10.)
         """
 
-        """
         opt = adam(params, lr)
         grads = gradient_clipping(grads, 10.)
-        """
         updates = opt.updates(params, grads)
+        updates_train.update(updates)
         self.train_function = theano.function([v], monitor,
                                                updates=updates_train)
         self.generate_function = theano.function([], v_t,
@@ -272,19 +277,21 @@ class LstmRbm:
 
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
-    minibatch_size = 1
-    n_epochs = 5
+    minibatch_size = 100
+    n_epochs = 200
     random_state = np.random.RandomState(1999)
 
-    speech = fetch_fruitspeech_spectrogram()
-    data = speech["data"]
-    data = [(d > 5).astype(theano.config.floatX) for d in data[:1]]
-    """
-    data = random_state.rand(1000, 22, 256)
-    data = [(d > 0.8).astype(theano.config.floatX) for d in data]
-    """
-    model = LstmRbm(n_visible=data[0].shape[-1])
+    key_range, dt, dataset = fetch_nottingham()
+    if not os.path.exists('saved.pkl'):
+        model = LstmRbm(n_visible=dataset[0].shape[-1])
+        model.train(dataset, minibatch_size=minibatch_size, n_epochs=n_epochs)
+        cur = sys.getrecursionlimit()
+        sys.setrecursionlimit(40000)
+        with open('saved.pkl', mode='w') as f:
+            pickle.dump(model, f, -1)
+        sys.setrecursionlimit(cur)
 
-    model.train(data, minibatch_size=minibatch_size, n_epochs=n_epochs)
-    ex = model.generate()
-    print(ex.shape)
+    with open('saved.pkl', mode='r') as f:
+        model = pickle.load(f)
+    piano_roll = model.generate()
+    midiwrite("generation1.midi", piano_roll, key_range, dt)

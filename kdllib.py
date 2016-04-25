@@ -11,6 +11,7 @@ import scipy.signal as sg
 from collections import Iterable
 import wave
 import tarfile
+import zipfile
 import os
 import glob
 import re
@@ -108,6 +109,20 @@ def soundsc(X, copy=True):
     return X.astype('float32')
 
 
+def get_resource_dir(name, resource_dir=None, folder=None, create_dir=True):
+    """ Get dataset directory path """
+    if not resource_dir:
+        resource_dir = os.getenv("KDLLIB_DIR", os.path.join(
+            os.path.expanduser("~"), "kdllib_dir"))
+    if folder is None:
+        resource_dir = os.path.join(resource_dir, name)
+    else:
+        resource_dir = os.path.join(resource_dir, folder)
+    if not os.path.exists(resource_dir) and create_dir:
+        os.makedirs(resource_dir)
+    return resource_dir
+
+
 def download(url, server_fname, local_fname=None, progress_update_percentage=5,
              bypass_certificate_check=False):
     """
@@ -148,6 +163,31 @@ def download(url, server_fname, local_fname=None, progress_update_percentage=5,
                                                100. / file_size)
                 print(status)
                 p += progress_update_percentage
+
+
+def midiwrap():
+    """
+    Wrapper to midi read and midi write
+    """
+    try:
+        sys.path.insert(1, get_resource_dir(""))
+        from midi.utils import midiread, midiwrite
+        sys.path.pop(1)
+    except ImportError:
+        print("Need GPL licensed midi utils, downloading...",
+              "http://www.iro.umontreal.ca/~lisa/deep/midi.zip")
+        url = "http://www.iro.umontreal.ca/~lisa/deep/midi.zip"
+        partial_path = get_resource_dir("")
+        full_path = os.path.join(partial_path, "midi.zip")
+        if not os.path.exists(full_path):
+            download(url, full_path)
+            zip_ref = zipfile.ZipFile(full_path, 'r')
+            zip_ref.extractall(partial_path)
+            zip_ref.close()
+        sys.path.insert(1, get_resource_dir(""))
+        from midi.utils import midiread, midiwrite
+        sys.path.pop(1)
+    return midiread, midiwrite
 
 
 class BlizzardThread(threading.Thread):
@@ -1825,6 +1865,32 @@ def apply_lpc_softmax_preproc(X, fs=8000):
         return agc_x_r
 
     return X, _apply, _re_sub
+
+
+def fetch_nottingham():
+    midiread, midiwrite = midiwrap()
+    url = "http://www.iro.umontreal.ca/~lisa/deep/data/Nottingham.zip"
+    partial_path = get_resource_dir("nottingham")
+    full_path = os.path.join(partial_path, "Nottingham.zip")
+    if not os.path.exists(full_path):
+        download(url, full_path)
+        zip_ref = zipfile.ZipFile(full_path, 'r')
+        zip_ref.extractall(partial_path)
+        zip_ref.close()
+    key_range = (21, 109)
+    dt = 0.3
+
+    all_data = []
+    with zipfile.ZipFile(full_path, "r") as f:
+        for name in f.namelist():
+            if ".mid" not in name:
+                # Skip README
+                continue
+            p = os.path.join(partial_path, name)
+            data = midiread(p, key_range, dt).piano_roll.astype(
+                theano.config.floatX)
+            all_data.append(data)
+    return key_range, dt, all_data
 
 
 def fetch_fruitspeech_softmax():

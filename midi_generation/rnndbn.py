@@ -12,90 +12,22 @@
 import os
 import sys
 import numpy as np
-import zipfile
-import glob
 try:
     import urllib.request as urllib  # for backwards compatibility
 except ImportError:
     import urllib2 as urllib
 
-try:
-    from midi.utils import midiread, midiwrite
-except ImportError:
-    raise ImportError("Need GPL licensed midi utils",
-                      "Can be downloaded by doing the following in the script dir",
-                      "wget http://www.iro.umontreal.ca/~lisa/deep/midi.zip; unzip midi.zip")
 import theano
 from theano import tensor
 from theano.tensor.shared_randomstreams import RandomStreams
 import cPickle as pickle
+from kdllib import midiwrap, fetch_nottingham
+midiread, midiwrite = midiwrap()
 
 #Don't use python long as this doesn't work on 32 bit computers.
 np.random.seed(0xbeef)
 rng = RandomStreams(seed=np.random.randint(1 << 30))
 theano.config.warn.subtensor_merge_bug = False
-
-
-def download(url, server_fname, local_fname=None, progress_update_percentage=5,
-             bypass_certificate_check=False):
-    """
-    An internet download utility modified from
-    http://stackoverflow.com/questions/22676/
-    how-do-i-download-a-file-over-http-using-python/22776#22776
-    """
-    if bypass_certificate_check:
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        u = urllib.urlopen(url, context=ctx)
-    else:
-        u = urllib.urlopen(url)
-    if local_fname is None:
-        local_fname = server_fname
-    full_path = local_fname
-    meta = u.info()
-    with open(full_path, 'wb') as f:
-        try:
-            file_size = int(meta.get("Content-Length"))
-        except TypeError:
-            print("WARNING: Cannot get file size, displaying bytes instead!")
-            file_size = 100
-        print("Downloading: %s Bytes: %s" % (server_fname, file_size))
-        file_size_dl = 0
-        block_sz = int(1E7)
-        p = 0
-        while True:
-            buffer = u.read(block_sz)
-            if not buffer:
-                break
-            file_size_dl += len(buffer)
-            f.write(buffer)
-            if (file_size_dl * 100. / file_size) > p:
-                status = r"%10d  [%3.2f%%]" % (file_size_dl, file_size_dl *
-                                               100. / file_size)
-                print(status)
-                p += progress_update_percentage
-
-
-def fetch_nottingham():
-    url = "http://www.iro.umontreal.ca/~lisa/deep/data/Nottingham.zip"
-    data_path = "Nottingham.zip"
-    if not os.path.exists(data_path):
-        download(url, data_path)
-    key_range = (21, 109)
-    dt = 0.3
-
-    all_data = []
-    zip_ref = zipfile.ZipFile(data_path, 'r')
-    root = os.path.split(os.path.dirname(__file__))[0]
-    zip_ref.extractall(root)
-    zip_ref.close()
-    re = os.path.join(os.path.split(os.path.dirname(__file__))[0],
-                                    'Nottingham', 'train', '*.mid')
-    all_data = [midiread(f, key_range, dt).piano_roll.astype(
-        theano.config.floatX) for f in glob.glob(re)]
-    return key_range, dt, all_data
 
 
 def build_rbm(v, W, bv, bh, k):
@@ -319,7 +251,7 @@ dt : float
         self.r = r
         self.dt = dt
 
-        (v, v_sample, cost1, monitor1, params1, updates_train1, h, h1_sample , cost2, monitor2, params2, updates_train2, v_t,
+        (v, v_sample, cost1, monitor1, params1, updates_train1, h, h1_sample, cost2, monitor2, params2, updates_train2, v_t,
          updates_generate) = build_rnnrbm(r[1] - r[0], n_hidden,
                                            n_hidden_recurrent)
         '''
