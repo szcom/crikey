@@ -12,6 +12,7 @@ from kdllib import fetch_fruitspeech_spectrogram, list_iterator, np_zeros, GRU, 
 from kdllib import make_weights, as_shared, adam, gradient_clipping, theano_one_hot
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import save_checkpoint, save_weights, relu, tanh, soundsc
+from kdllib import run_loop
 
 if __name__ == "__main__":
     import argparse
@@ -241,10 +242,10 @@ if __name__ == "__main__":
     params = []
     w_conv1, = make_conv_weights(1, (n_kernels,), (conv_size1, input_dim),
                                  random_state)
-    b_conv1, = make_biases((n_kernels,), conv=True)
+    b_conv1, = make_biases((n_kernels,))
     w_conv2, = make_conv_weights(n_kernels, (n_kernels,),
                                  (conv_size2, 1), random_state)
-    b_conv2, = make_biases((n_kernels,), conv=True)
+    b_conv2, = make_biases((n_kernels,))
     params += [w_conv1, b_conv1, w_conv2, b_conv2]
 
     # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
@@ -281,13 +282,13 @@ if __name__ == "__main__":
     w_deconv1, = make_conv_weights(1, (n_kernels,),
                                    (deconv_size1, input_dim + 1),
                                    random_state)
-    b_deconv1, = make_biases((n_kernels,), conv=True)
+    b_deconv1, = make_biases((n_kernels,))
     w_deconv2, = make_conv_weights(n_kernels, (n_kernels,),
                                  (deconv_size2, input_dim + 1), random_state)
-    b_deconv2, = make_biases((n_kernels,), conv=True)
+    b_deconv2, = make_biases((n_kernels,))
     w_deconv3, = make_conv_weights(n_kernels, (n_kernels,),
                                  (deconv_size2, input_dim + 1), random_state)
-    b_deconv3, = make_biases((n_kernels,), conv=True)
+    b_deconv3, = make_biases((n_kernels,))
     params += [w_deconv1, b_deconv1, w_deconv2, b_deconv2, w_deconv3, b_deconv3]
 
     w_blurconv, = make_conv_weights(n_kernels, (n_kernels,),
@@ -698,45 +699,5 @@ if __name__ == "__main__":
         partial_costs.append(current_cost)
         return partial_costs
 
-    for e in range(start_epoch, start_epoch + n_epochs):
-        train_costs = []
-        try:
-            while True:
-                partial_train_costs = _loop(train_function, train_itr)
-                train_costs.append(np.mean(partial_train_costs))
-                if train_mb_count % monitor_frequency == 0:
-                    print("starting train mb %i" % train_mb_count)
-                    print("current epoch mean cost %f" % np.mean(train_costs))
-                train_mb_count += 1
-        except StopIteration:
-            valid_costs = []
-            try:
-                while True:
-                    partial_valid_costs = _loop(cost_function, valid_itr)
-                    valid_costs.append(np.mean(partial_valid_costs))
-                    if valid_mb_count % monitor_frequency == 0:
-                        print("starting valid mb %i" % valid_mb_count)
-                        print("current validation mean cost %f" % np.mean(
-                            valid_costs))
-                    valid_mb_count += 1
-            except StopIteration:
-                pass
-            mean_epoch_train_cost = np.mean(train_costs)
-            mean_epoch_valid_cost = np.mean(valid_costs)
-            overall_train_costs.append(mean_epoch_train_cost)
-            overall_valid_costs.append(mean_epoch_valid_cost)
-            checkpoint_dict["overall_train_costs"] = overall_train_costs
-            checkpoint_dict["overall_valid_costs"] = overall_valid_costs
-            script = os.path.realpath(__file__)
-            print("Script %s" % script)
-            print("epoch %i complete" % e)
-            print("epoch mean train cost %f" % mean_epoch_train_cost)
-            print("epoch mean valid cost %f" % mean_epoch_valid_cost)
-            print("overall train costs %s" % overall_train_costs[-5:])
-            print("overall valid costs %s" % overall_valid_costs[-5:])
-            if ((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
-                print("Checkpointing...")
-                checkpoint_save_path = "model_checkpoint_%i.pkl" % e
-                weights_save_path = "model_weights_%i.npz" % e
-                save_checkpoint(checkpoint_save_path, checkpoint_dict)
-                save_weights(weights_save_path, checkpoint_dict)
+run_loop(_loop, train_function, train_itr, cost_function, valid_itr,
+         n_epochs=n_epochs, checkpoint_dict=checkpoint_dict)
