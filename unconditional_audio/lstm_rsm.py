@@ -167,8 +167,8 @@ def build_lstmrbm(n_visible, n_hidden, n_hidden_recurrent):
     # variables
 
     v = tensor.matrix()  # a training sequence
-    u0 = tensor.zeros((n_hidden_recurrent,))  # initial value for the RNN hidden
-                                         # units
+    u0 = tensor.zeros((n_hidden_recurrent,))  # initial value for the RNN
+                                              # hidden units
     q0 = tensor.zeros((n_hidden_recurrent,))
     c0 = tensor.zeros((n_hidden_recurrent,))
 
