@@ -22,16 +22,6 @@ np.random.seed(0xbeef)
 rng = RandomStreams(seed=np.random.randint(1 << 30))
 theano.config.warn.subtensor_merge_bug = False
 
-def fast_dropout(rng, x, debug=False):
-    '''
-    Multiply activations by N(1,1)
-    '''
-    if debug:
-        return x
-    else:
-        mask = rng.normal(size=x.shape, avg=1., dtype=theano.config.floatX)
-        return x * mask
-
 def build_rbm(v, W, bv, bh, k):
     '''
     Construct a k-step Gibbs chain starting at v for an RBM.
@@ -62,13 +52,13 @@ def build_rbm(v, W, bv, bh, k):
     '''
 
     def gibbs_step(v, debug=False):
-        mean_h = tensor.nnet.sigmoid(fast_dropout(rng, v).dot(W) + bh)
+        mean_h = tensor.nnet.sigmoid(v.dot(W) + bh)
         if debug:
             h = tensor.zeros_like(mean_h)
         else:
             h = rng.binomial(size=mean_h.shape, n=1, p=mean_h,
                              dtype=theano.config.floatX)
-        mean_v = tensor.nnet.sigmoid(fast_dropout(rng, h).dot(W.T) + bv)
+        mean_v = tensor.nnet.sigmoid(h.dot(W.T) + bv)
         if debug:
             v = tensor.zeros_like(mean_v)
         else:

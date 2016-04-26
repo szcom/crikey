@@ -35,55 +35,9 @@ try:
 except ImportError:
     import urllib2 as urllib
 
-
-def unpool(input, pool_size=(1, 1)):
-    return input.repeat(pool_size[0], axis=2).repeat(pool_size[1], axis=3)
-
-
-def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
-    # swap to in dim out dim to make life easier
-    filters = filters.transpose(1, 0, 2, 3)
-    return conv2d_grad_wrt_inputs(
-            output_grad=input,
-            filters=filters,
-            input_shape=(None, None, input.shape[2], input.shape[3]),
-            border_mode=border_mode,
-            subsample=stride,
-            filter_flip=True)
-
-
-def t_conv_out_size(input_size, filter_size, stride, pad):
-    # Author: Francesco Visin
-    """Computes the length of the output of a transposed convolution
-    Parameters
-    ----------
-    input_size : int, Iterable or Theano tensor
-        The size of the input of the transposed convolution
-    filter_size : int, Iterable or Theano tensor
-        The size of the filter
-    stride : int, Iterable or Theano tensor
-        The stride of the transposed convolution
-    pad : int, Iterable, Theano tensor or string
-        The padding of the transposed convolution
-    """
-    if input_size is None:
-        return None
-    input_size = np.array(input_size)
-    filter_size = np.array(filter_size)
-    stride = np.array(stride)
-    if isinstance(pad, (int, Iterable)) and not isinstance(pad, str):
-        pad = np.array(pad)
-        output_size = (input_size - 1) * stride + filter_size - 2*pad
-
-    elif pad == 'full':
-        output_size = input_size * stride - filter_size - stride + 2
-    elif pad == 'valid':
-        output_size = (input_size - 1) * stride + filter_size
-    elif pad == 'same':
-        output_size = input_size
-    return output_size
-
-
+"""
+begin datasets
+"""
 def soundsc(X, copy=True):
     """
     Approximate implementation of soundsc from MATLAB without the audio playing.
@@ -340,78 +294,15 @@ class Blizzard_dataset(object):
                 self.queue.put(group)
         return wav_group, text_group
 
-    def _pre(self, x):
-        n_fft = self.n_fft
-        n_step = self.n_step
-        X_stft = stft(x, n_fft, step=n_step)
-        # Power spectrum
-        X_mag = complex_to_abs(X_stft)
-        X_mag = np.log10(X_mag + 1E-9)
-        # unwrap phase then take delta
-        X_phase = complex_to_angle(X_stft)
-        X_phase = np.vstack((np.zeros_like(X_phase[0][None]), X_phase))
-        # Adding zeros to make network predict what *delta* in phase makes sense
-        X_phase_unwrap = np.unwrap(X_phase, axis=0)
-        X_phase_delta = X_phase_unwrap[1:] - X_phase_unwrap[:-1]
-        X_mag_phase = np.hstack((X_mag, X_phase_delta))
-        return X_mag_phase
-
-    def _re(self, x):
-        n_fft = self.n_fft
-        n_step = self.n_step
-        # X_mag_phase = unscale(x)
-        X_mag_phase = x
-        X_mag = X_mag_phase[:, :n_fft // 2]
-        X_mag = 10 ** X_mag
-        X_phase_delta = X_mag_phase[:, n_fft // 2:]
-        # Append leading 0s for consistency
-        X_phase_delta = np.vstack((np.zeros_like(X_phase_delta[0][None]),
-                                   X_phase_delta))
-        X_phase = np.cumsum(X_phase_delta, axis=0)[:-1]
-        X_stft = abs_and_angle_to_complex(X_mag, X_phase)
-        X_r = istft(X_stft, n_fft, step=n_step, wsola=False)
-        return X_r
-
-    """
-    # Can't figure out how to do this yet...
-    # Iterators R hard
-    X = [_pre(di) for di in d]
-    X_len = np.sum([len(Xi) for Xi in X])
-    X_sum = np.sum([Xi.sum(axis=0) for Xi in X], axis=0)
-    X_mean = X_sum / X_len
-    X_var = np.sum([np.sum((Xi - X_mean[None]) ** 2, axis=0)
-                    for Xi in X], axis=0) / X_len
-
-    def scale(x):
-        # WARNING: OPERATES IN PLACE!!!
-        # Can only realistically scale magnitude...
-        # Phase cost depends on circularity
-        x = np.copy(x)
-        _x = x[:, :n_fft // 2]
-        _mean = X_mean[None, :n_fft // 2]
-        _var = X_var[None, :n_fft // 2]
-        x[:, :n_fft // 2] = (_x - _mean) / _var
-        return x
-
-    def unscale(x):
-        # WARNING: OPERATES IN PLACE!!!
-        # Can only realistically scale magnitude...
-        # Phase cost depends on circularity
-        x = np.copy(x)
-        _x = x[:, :n_fft // 2]
-        _mean = X_mean[None, :n_fft // 2]
-        _var = X_var[None, :n_fft // 2]
-        x[:, :n_fft // 2] = _x * _var + _mean
-        return x
-    """
-
 
 def fetch_sample_speech_fruit(n_samples=None):
     url = 'https://dl.dropboxusercontent.com/u/15378192/audio.tar.gz'
-    wav_path = "audio.tar.gz"
-    if not os.path.exists(wav_path):
-        download(url, wav_path)
-    tf = tarfile.open(wav_path)
+    partial_path = get_resource_dir("fruit")
+    full_path = os.path.join(partial_path, "audio.tar.gz")
+    if not os.path.exists(full_path):
+        download(url, full_path)
+
+    tf = tarfile.open(full_path)
     wav_names = [fname for fname in tf.getnames()
                  if ".wav" in fname.split(os.sep)[-1]]
     speech = []
@@ -1459,55 +1350,6 @@ def lpc_synthesis(lp_coefficients, per_frame_gain, residual_excitation=None,
     return synthesized
 
 
-def run_lpc_example():
-    fs, X = fetch_sample_speech_tapestry()
-    window_size = 256
-    window_step = 128
-    a, g, e = lpc_analysis(X, order=8, window_step=window_step,
-                           window_size=window_size, emphasis=0.9,
-                           copy=True)
-    v, p = voiced_unvoiced(X, window_size=window_size,
-                           window_step=window_step)
-    X_r = lpc_synthesis(a, g, e, voiced_frames=v,
-                        emphasis=0.9, window_step=window_step)
-    wavfile.write("lpc_orig.wav", fs, soundsc(X))
-    wavfile.write("lpc_rec.wav", fs, soundsc(X_r))
-
-
-def run_fft_dct_example():
-    # This is an example of the preproc we want to do with a lot of added noise
-    random_state = np.random.RandomState(1999)
-
-    fs, d, _ = fetch_sample_speech_fruit()
-    n_fft = 128
-    X = d[0]
-    X_stft = stft(X, n_fft)
-    X_rr = complex_to_real_view(X_stft).ravel()
-    X_dct = mdct_slow(X_rr, n_fft)
-    """
-    X_dct_sub = X_dct[1:] - X_dct[:-1]
-    std = X_dct_sub.std(axis=0, keepdims=True)
-    X_dct_sub += .15 * std * random_state.randn(
-        X_dct_sub.shape[0], X_dct_sub.shape[1])
-    X_dct_unsub = np.cumsum(X_dct_sub, axis=0)
-    X_idct = imdct_slow(X_dct_unsub, n_fft).reshape(-1, n_fft)
-    """
-    #std = X_dct.std(axis=0, keepdims=True)
-    #X_dct[:, 80:] = 0.
-    #X_dct += .8 * std * random_state.randn(
-    #    X_dct.shape[0], X_dct.shape[1])
-    X_idct = imdct_slow(X_dct, n_fft).reshape(-1, n_fft)
-    X_irr = real_to_complex_view(X_idct)
-    X_r = istft(X_irr, n_fft)[:len(X)]
-    X_r = X_r - X_r.mean()
-
-    SNR = 20 * np.log10(np.linalg.norm(X - X_r) / np.linalg.norm(X))
-    print(SNR)
-
-    wavfile.write("fftdct_orig.wav", fs, soundsc(X))
-    wavfile.write("fftdct_rec.wav", fs, soundsc(X_r))
-
-
 class base_iterator(object):
     def __init__(self, list_of_containers, minibatch_size,
                  axis,
@@ -1641,17 +1483,18 @@ def get_dataset_dir(dataset_name):
                        (os.sep)[:-1] + [dataset_name])
 
 
-
-def dense_to_one_hot(labels_dense, num_classes=10):
+def dense_to_one_hot(labels_dense, n_classes=10):
     """Convert class labels from scalars to one-hot vectors."""
     labels_shape = labels_dense.shape
-    labels_dense = labels_dense.reshape([-1])
-    num_labels = labels_dense.shape[0]
-    index_offset = np.arange(num_labels) * num_classes
-    labels_one_hot = np.zeros((num_labels, num_classes))
-    labels_one_hot.flat[index_offset + labels_dense.ravel()] = 1
-    labels_one_hot = labels_one_hot.reshape(labels_shape+(num_classes,))
-    return labels_one_hot
+    labels_dtype = labels_dense.dtype
+    labels_dense = labels_dense.ravel().astype("int32")
+    n_labels = labels_dense.shape[0]
+    index_offset = np.arange(n_labels) * n_classes
+    labels_one_hot = np.zeros((n_labels, n_classes))
+    labels_one_hot[np.arange(n_labels).astype("int32"),
+                   labels_dense.ravel()] = 1
+    labels_one_hot = labels_one_hot.reshape(labels_shape+(n_classes,))
+    return labels_one_hot.astype(labels_dtype)
 
 
 def tokenize_ind(phrase, vocabulary):
@@ -2053,6 +1896,44 @@ def fetch_fruitspeech():
     return speech
 
 
+def fetch_fruitspeech_spectrogram_nonpar():
+    fs, d, wav_names = fetch_sample_speech_fruit()
+    def matcher(name):
+        return name.split("/")[1]
+
+    classes = [matcher(wav_name) for wav_name in wav_names]
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    X, _re = apply_spectrogram_preproc(d)
+
+    X_d = np.vstack(X)
+
+    from IPython import embed; embed()
+    raise ValueError()
+
+    """
+    for n, Xi in enumerate(X[::8]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
+
+
 def fetch_fruitspeech_nonpar():
     fs, d, wav_names = fetch_sample_speech_fruit()
     def matcher(name):
@@ -2390,64 +2271,13 @@ def fetch_walla():
     speech["target"] = y
     speech["reconstruct"] = _re
     return speech
+"""
+end datasets
+"""
 
-
-def plot_lines_iamondb_example(X, title="", save_name=None):
-    import matplotlib.pyplot as plt
-    f, ax = plt.subplots()
-    x = np.cumsum(X[:, 1])
-    y = np.cumsum(X[:, 2])
-
-    size_x = x.max() - x.min()
-    size_y = y.max() - y.min()
-
-    f.set_size_inches(5 * size_x / size_y, 5)
-    cuts = np.where(X[:, 0] == 1)[0]
-    start = 0
-
-    for cut_value in cuts:
-        ax.plot(x[start:cut_value], y[start:cut_value],
-                'k-', linewidth=1.5)
-        start = cut_value + 1
-    ax.axis('equal')
-    ax.axes.get_xaxis().set_visible(False)
-    ax.axes.get_yaxis().set_visible(False)
-    ax.set_title(title)
-
-    if save_name is None:
-        plt.show()
-    else:
-        plt.savefig(save_name, bbox_inches='tight', pad_inches=0)
-
-
-def implot(arr, title="", cmap="gray", save_name=None):
-    import matplotlib.pyplot as plt
-    f, ax = plt.subplots()
-    ax.matshow(arr, cmap=cmap)
-    plt.axis("off")
-
-    def autoaspect(x_range, y_range):
-        """
-        The aspect to make a plot square with ax.set_aspect in Matplotlib
-        """
-        mx = max(x_range, y_range)
-        mn = min(x_range, y_range)
-        if x_range <= y_range:
-            return mx / float(mn)
-        else:
-            return mn / float(mx)
-
-    x1 = arr.shape[0]
-    y1 = arr.shape[1]
-    asp = autoaspect(x1, y1)
-    ax.set_aspect(asp)
-    plt.title(title)
-    if save_name is None:
-        plt.show()
-    else:
-        plt.savefig(save_name)
-
-
+"""
+begin initializers and Theano functions
+"""
 def np_zeros(shape):
     """
     Builds a numpy variable filled with zeros
@@ -2991,6 +2821,54 @@ def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
                          for out_dim in out_dims])
 
 
+def unpool(input, pool_size=(1, 1)):
+    return input.repeat(pool_size[0], axis=2).repeat(pool_size[1], axis=3)
+
+
+def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
+    # swap to in dim out dim to make life easier
+    filters = filters.transpose(1, 0, 2, 3)
+    return conv2d_grad_wrt_inputs(
+            output_grad=input,
+            filters=filters,
+            input_shape=(None, None, input.shape[2], input.shape[3]),
+            border_mode=border_mode,
+            subsample=stride,
+            filter_flip=True)
+
+
+def t_conv_out_size(input_size, filter_size, stride, pad):
+    # Author: Francesco Visin
+    """Computes the length of the output of a transposed convolution
+    Parameters
+    ----------
+    input_size : int, Iterable or Theano tensor
+        The size of the input of the transposed convolution
+    filter_size : int, Iterable or Theano tensor
+        The size of the filter
+    stride : int, Iterable or Theano tensor
+        The stride of the transposed convolution
+    pad : int, Iterable, Theano tensor or string
+        The padding of the transposed convolution
+    """
+    if input_size is None:
+        return None
+    input_size = np.array(input_size)
+    filter_size = np.array(filter_size)
+    stride = np.array(stride)
+    if isinstance(pad, (int, Iterable)) and not isinstance(pad, str):
+        pad = np.array(pad)
+        output_size = (input_size - 1) * stride + filter_size - 2*pad
+
+    elif pad == 'full':
+        output_size = input_size * stride - filter_size - stride + 2
+    elif pad == 'valid':
+        output_size = (input_size - 1) * stride + filter_size
+    elif pad == 'same':
+        output_size = input_size
+    return output_size
+
+
 def gru_weights(input_dim, hidden_dim, random_state):
     shape = (input_dim, hidden_dim)
     W = np.hstack([np_normal(shape, random_state),
@@ -3279,8 +3157,13 @@ def sample_bernoulli_and_bivariate_gmm(mu, sigma, corr, coeff, binary,
     s_y = s_y.dimshuffle(0, 'x')
     s = tensor.concatenate([binary, s_x, s_y], axis=1)
     return s
+"""
+end initializers and Theano functions
+"""
 
-
+"""
+start optimizers
+"""
 def gradient_clipping(grads, rescale=5.):
     grad_norm = tensor.sqrt(sum(map(lambda x: tensor.sqr(x).sum(), grads)))
     scaling_num = rescale
@@ -3508,8 +3391,13 @@ class adam(object):
             updates.append((param, p_t))
         updates.append((itr, i_t))
         return updates
+"""
+end optimizers
+"""
 
-
+"""
+start training utilities
+"""
 def get_shared_variables_from_function(func):
     shared_variable_indices = [n for n, var in enumerate(func.maker.inputs)
                                if isinstance(var.variable,
@@ -3579,21 +3467,33 @@ def load_checkpoint(saved_checkpoint_path):
     sys.setrecursionlimit(old_recursion_limit)
     return pickle_item
 
-def run_blizzard_example():
-    bliz = Blizzard_dataset()
-    start = time.time()
-    itr = 1
-    while True:
-        r = bliz.next()
-        stop = time.time()
-        tot = stop - start
-        print("Threaded time: %s" % (tot))
-        print("Minibatch %s" % str(itr))
-        print("Time ratio (s per minibatch): %s" % (tot / float(itr)))
-        itr += 1
-        break
-    import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
-    raise ValueError()
+
+def implot(arr, title="", cmap="gray", save_name=None):
+    import matplotlib.pyplot as plt
+    f, ax = plt.subplots()
+    ax.matshow(arr, cmap=cmap)
+    plt.axis("off")
+
+    def autoaspect(x_range, y_range):
+        """
+        The aspect to make a plot square with ax.set_aspect in Matplotlib
+        """
+        mx = max(x_range, y_range)
+        mn = min(x_range, y_range)
+        if x_range <= y_range:
+            return mx / float(mn)
+        else:
+            return mn / float(mx)
+
+    x1 = arr.shape[0]
+    y1 = arr.shape[1]
+    asp = autoaspect(x1, y1)
+    ax.set_aspect(asp)
+    plt.title(title)
+    if save_name is None:
+        plt.show()
+    else:
+        plt.savefig(save_name)
 
 
 def run_loop(loop_function, train_function, train_itr,
@@ -3650,7 +3550,80 @@ def run_loop(loop_function, train_function, train_itr,
                 weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                 save_checkpoint(checkpoint_save_path, checkpoint_dict)
                 save_weights(weights_save_path, checkpoint_dict)
+"""
+end training utilities
+"""
 
+"""
+start examples
+"""
+def run_lpc_example():
+    fs, X = fetch_sample_speech_tapestry()
+    window_size = 256
+    window_step = 128
+    a, g, e = lpc_analysis(X, order=8, window_step=window_step,
+                           window_size=window_size, emphasis=0.9,
+                           copy=True)
+    v, p = voiced_unvoiced(X, window_size=window_size,
+                           window_step=window_step)
+    X_r = lpc_synthesis(a, g, e, voiced_frames=v,
+                        emphasis=0.9, window_step=window_step)
+    wavfile.write("lpc_orig.wav", fs, soundsc(X))
+    wavfile.write("lpc_rec.wav", fs, soundsc(X_r))
+
+
+def run_fft_dct_example():
+    # This is an example of the preproc we want to do with a lot of added noise
+    random_state = np.random.RandomState(1999)
+
+    fs, d, _ = fetch_sample_speech_fruit()
+    n_fft = 128
+    X = d[0]
+    X_stft = stft(X, n_fft)
+    X_rr = complex_to_real_view(X_stft).ravel()
+    X_dct = mdct_slow(X_rr, n_fft)
+    """
+    X_dct_sub = X_dct[1:] - X_dct[:-1]
+    std = X_dct_sub.std(axis=0, keepdims=True)
+    X_dct_sub += .15 * std * random_state.randn(
+        X_dct_sub.shape[0], X_dct_sub.shape[1])
+    X_dct_unsub = np.cumsum(X_dct_sub, axis=0)
+    X_idct = imdct_slow(X_dct_unsub, n_fft).reshape(-1, n_fft)
+    """
+    #std = X_dct.std(axis=0, keepdims=True)
+    #X_dct[:, 80:] = 0.
+    #X_dct += .8 * std * random_state.randn(
+    #    X_dct.shape[0], X_dct.shape[1])
+    X_idct = imdct_slow(X_dct, n_fft).reshape(-1, n_fft)
+    X_irr = real_to_complex_view(X_idct)
+    X_r = istft(X_irr, n_fft)[:len(X)]
+    X_r = X_r - X_r.mean()
+
+    SNR = 20 * np.log10(np.linalg.norm(X - X_r) / np.linalg.norm(X))
+    print(SNR)
+
+    wavfile.write("fftdct_orig.wav", fs, soundsc(X))
+    wavfile.write("fftdct_rec.wav", fs, soundsc(X_r))
+
+
+def run_blizzard_example():
+    bliz = Blizzard_dataset()
+    start = time.time()
+    itr = 1
+    while True:
+        r = bliz.next()
+        stop = time.time()
+        tot = stop - start
+        print("Threaded time: %s" % (tot))
+        print("Minibatch %s" % str(itr))
+        print("Time ratio (s per minibatch): %s" % (tot / float(itr)))
+        itr += 1
+        break
+    import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+    raise ValueError()
+"""
+end examples
+"""
 
 if __name__ == "__main__":
     #run_fft_dct_example()
