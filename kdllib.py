@@ -1,6 +1,6 @@
 # License: BSD 3-clause
 # Authors: Kyle Kastner
-
+from __future__ import print_function
 import numpy as np
 import uuid
 from numpy.lib.stride_tricks import as_strided
@@ -8,7 +8,8 @@ from scipy import linalg, fftpack
 from scipy.cluster.vq import kmeans, vq
 from scipy.io import wavfile
 import scipy.signal as sg
-from collections import Iterable
+import inspect
+from collections import Iterable, defaultdict
 import wave
 import tarfile
 import zipfile
@@ -1569,7 +1570,8 @@ def apply_stft_preproc(X, n_fft=128, n_step_frac=4):
     return X, _re
 
 
-def apply_spectrogram_preproc(X, n_fft=512, n_step_frac=10):
+def apply_binned_spectrogram_preproc(X, n_fft=512, n_step_frac=10,
+                                     n_bins=10):
     n_step = n_fft // n_step_frac
 
     def _pre(x):
@@ -1595,7 +1597,6 @@ def apply_spectrogram_preproc(X, n_fft=512, n_step_frac=10):
         x = x * (X_max - X_min) + X_min
         return x
 
-    n_bins = 10
     # Extra n because bin is reserved kwd in Python
     bins = np.linspace(0, 1, n_bins)
     def binn(x):
@@ -1625,6 +1626,73 @@ def apply_spectrogram_preproc(X, n_fft=512, n_step_frac=10):
         X_r = iterate_invert_spectrogram(X_s, n_fft, n_step)
         return X_r
     return X, _re
+
+
+def apply_labeled_spectrogram_preproc(X, n_fft=512, n_step_frac=10,
+                                      n_bins=10):
+
+    X, _re = apply_binned_spectrogram_preproc(X, n_fft=n_fft,
+                                              n_step_frac=n_step_frac,
+                                              n_bins=n_bins)
+    # Make sum and var lookup for discretization of class preds
+    sum_lookup = defaultdict(list)
+    var_lookup = defaultdict(list)
+    sum_labels = []
+    var_labels = []
+    for Xi in X:
+        sums = Xi.sum(axis=1)
+        sum_label_set = []
+        for n, s in enumerate(sums):
+            sum_lookup[s].append(Xi[n])
+            sum_label_set.append(s)
+        sum_labels.append(sum_label_set)
+
+        # vars is reserved...
+        varis = Xi.var(axis=1)
+        var_label_set = []
+        for n, v in enumerate(varis):
+            var_lookup[v].append(Xi[n])
+            var_label_set.append(v)
+        var_labels.append(var_label_set)
+
+    class_to_sum = {k: v for k,v in enumerate(sorted(sum_lookup.keys()))}
+    sum_to_class = {v: k for k,v in class_to_sum.items()}
+    class_to_var = {k: v for k,v in enumerate(sorted(var_lookup.keys()))}
+    var_to_class = {v: k for k,v in class_to_var.items()}
+
+    sum_labels = [np.array([sum_to_class[ii] for ii in i]).astype("int32")
+                  for i in sum_labels]
+    var_labels = [np.array([var_to_class[ii] for ii in i]).astype("int32")
+                  for i in var_labels]
+
+    def _full_re(s, v):
+        assert len(s) == len(v)
+        # slow distance minimization loop for decode
+        res = []
+        for s_t, v_t in zip(s, v):
+            s_cand = sum_lookup[class_to_sum[s_t]]
+            v_cand = var_lookup[class_to_var[v_t]]
+            dist = np.zeros((len(s_cand), len(v_cand)))
+            # Could do as as outer product for speed
+            for i, s_c in enumerate(s_cand):
+                s_c_norm = np.sqrt(np.sum(s_c ** 2))
+                for j, v_c in enumerate(v_cand):
+                    v_c_norm = np.sqrt(np.sum(v_c ** 2))
+                    dist_ij = np.sqrt(np.sum((s_c - v_c) ** 2))
+                    dist_ij /= (s_c_norm * v_c_norm)
+                    dist[i, j] = dist_ij
+            if any(dist.ravel() < 1E-9):
+                # if any are almost 0, take it!
+                sum_idx = np.where(dist < 1E-9)[0][0]
+            else:
+                # find which one minimizes all var scores
+                sum_idx = np.argmin(np.sum(dist, axis=1))
+            final_cand = s_cand[sum_idx]
+            res.append(final_cand)
+        res = np.asarray(res)
+        res = _re(res)
+        return res
+    return sum_labels, var_labels, _full_re
 
 
 def apply_lpc_softmax_preproc(X, fs=8000):
@@ -1909,26 +1977,26 @@ def fetch_fruitspeech_spectrogram_nonpar():
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
-    X, _re = apply_spectrogram_preproc(d)
-
-    X_d = np.vstack(X)
-
-    from IPython import embed; embed()
-    raise ValueError()
+    data1, data2, _re = apply_labeled_spectrogram_preproc(d, n_bins=10)
 
     """
-    for n, Xi in enumerate(X[::8]):
-        di = _re(Xi)
+    # Check reconstructions
+    for n, (s_l, v_l) in enumerate(list(zip(data1, data2))[::8]):
+        di = _re(s_l, v_l)
         wavfile.write("t_%i.wav" % n, fs, soundsc(di))
-
     raise ValueError()
     """
 
+    data1_size = max([max(d1) for d1 in data1])
+    data2_size = max([max(d2) for d2 in data2])
     speech = {}
     speech["vocabulary_size"] = vocabulary_size
     speech["vocabulary"] = char2code
     speech["sample_rate"] = fs
-    speech["data"] = X
+    speech["data1"] = data1
+    speech["data1_size"] = data1_size
+    speech["data2"] = data2
+    speech["data2_size"] = data2_size
     speech["target"] = y
     speech["reconstruct"] = _re
     return speech
@@ -2951,10 +3019,10 @@ def tanh(x):
     return tensor.tanh(x)
 
 
-def theano_one_hot(t, r=None):
-    if r is None:
-        r = tensor.max(t) + 1
-    ranges = tensor.shape_padleft(tensor.arange(r), t.ndim)
+def theano_one_hot(t, n_classes=None):
+    if n_classes is None:
+        n_classes = tensor.max(t) + 1
+    ranges = tensor.shape_padleft(tensor.arange(n_classes), t.ndim)
     return tensor.eq(ranges, tensor.shape_padright(t, 1))
 
 
@@ -3468,6 +3536,71 @@ def load_checkpoint(saved_checkpoint_path):
     return pickle_item
 
 
+def filled_js_template_from_results_dict(results_dict, default_show="all"):
+    # Uses arbiter strings in the template to split the template and stick
+    # values in
+    partial_path = get_resource_dir("js_plot_dependencies")
+    full_path = os.path.join(partial_path, "master.zip")
+    url = "http://github.com/kastnerkyle/simple_template_plotter/archive/master.zip"
+    if not os.path.exists(full_path):
+        print("Downloading plotter template code from %s" % url)
+        download(url, full_path)
+        zip_ref = zipfile.ZipFile(full_path, 'r')
+        zip_ref.extractall(partial_path)
+        zip_ref.close()
+
+    js_path = os.path.join(partial_path, "simple_template_plotter-master")
+    template_path =  os.path.join(js_path, "template.html")
+    f = open(template_path, mode='r')
+    all_template_lines = f.readlines()
+    f.close()
+    imports_split_index = [n for n, l in enumerate(all_template_lines)
+                           if "IMPORTS_SPLIT" in l][0]
+    data_split_index = [n for n, l in enumerate(all_template_lines)
+                        if "DATA_SPLIT" in l][0]
+    first_part = all_template_lines[:imports_split_index]
+    imports_part = []
+    js_files_path = os.path.join(js_path, "js")
+    js_file_names = ["jquery-1.9.1.js", "knockout-3.0.0.js",
+                     "highcharts.js", "exporting.js"]
+    js_files = [os.path.join(js_files_path, jsf) for jsf in js_file_names]
+    for js_file in js_files:
+        with open(js_file, "r") as f:
+            imports_part.extend(
+                ["<script>\n"] + f.readlines() + ["</script>\n"])
+    post_imports_part = all_template_lines[
+        imports_split_index + 1:data_split_index]
+    last_part = all_template_lines[data_split_index + 1:]
+
+    def gen_js_field_for_key_value(key, values, show=True):
+        assert type(values) is list
+        if isinstance(values[0], (np.generic, np.ndarray)):
+            values = [float(v.ravel()) for v in values]
+        maxlen = 1500
+        if len(values) > maxlen:
+            values = list(np.interp(np.linspace(0, len(values), maxlen),
+                          np.arange(len(values)), values))
+        show_key = "true" if show else "false"
+        return "{\n    name: '%s',\n    data: %s,\n    visible: %s\n},\n" % (
+            str(key), str(values), show_key)
+    data_part = [gen_js_field_for_key_value(k, results_dict[k], True)
+                 if k in default_show or default_show == "all"
+                 else gen_js_field_for_key_value(k, results_dict[k], False)
+                 for k in sorted(results_dict.keys())]
+    all_filled_lines = first_part + imports_part + post_imports_part
+    all_filled_lines = all_filled_lines + data_part + last_part
+    return all_filled_lines
+
+
+def save_results_as_html(save_path, results_dict, default_no_show="_auto"):
+    show_keys = [k for k in results_dict.keys()
+                 if "_auto" not in k]
+    as_html = filled_js_template_from_results_dict(
+        results_dict, default_show=show_keys)
+    with open(save_path, "w") as f:
+        f.writelines(as_html)
+
+
 def implot(arr, title="", cmap="gray", save_name=None):
     import matplotlib.pyplot as plt
     f, ax = plt.subplots()
@@ -3498,58 +3631,126 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
-             checkpoint_every_n=100, start_epoch=0, monitor_frequency=1000):
+             checkpoint_time_fraction=.05, checkpoint_delay=100,
+             start_epoch=0, monitor_frequency=1000):
     """
     loop function should return a list of costs
+
+    TODO: Make checkpoint time be *at most* X% overall runtime
+    TODO: Add fancy monitor from dagbldr
     """
+    # Assume these keys are all theano functions to ignore!
+    ignore_keys = checkpoint_dict.keys()
+    checkpoint_every_n = 100
     overall_train_costs = []
     overall_valid_costs = []
     _loop = loop_function
     ident = str(uuid.uuid4())[:8]
     train_mb_count = 0
     valid_mb_count = 0
+    random_state = np.random.RandomState(2177)
+    monitor_prob = 1. / monitor_frequency
+    min_train_cost = np.inf
+    min_valid_cost = np.inf
     for e in range(start_epoch, start_epoch + n_epochs):
         train_costs = []
+        print(" ")
+        print("starting training, epoch %i" % e)
+        print(" ")
         try:
             while True:
                 partial_train_costs = _loop(train_function, train_itr)
                 train_costs.append(np.mean(partial_train_costs))
-                if train_mb_count % monitor_frequency == 0:
+                draw = random_state.rand()
+                if draw < monitor_prob:
+                    print(" ")
                     print("starting train mb %i" % train_mb_count)
                     print("current epoch mean cost %f" % np.mean(train_costs))
+                    print(" ")
+                else:
+                    print(".", end="")
                 train_mb_count += 1
+            print(" ")
         except StopIteration:
             valid_costs = []
+            print(" ")
+            print("starting validation, epoch %i" % e)
+            print(" ")
             try:
                 while True:
                     partial_valid_costs = _loop(valid_function, valid_itr)
                     valid_costs.append(np.mean(partial_valid_costs))
-                    if valid_mb_count % monitor_frequency == 0:
-                        print("starting valid mb %i" % valid_mb_count)
+                    draw = random_state.rand()
+                    if draw < monitor_prob:
+                        print(" ")
+                        print("valid mb %i" % valid_mb_count)
                         print("current validation mean cost %f" % np.mean(
                             valid_costs))
+                        print(" ")
+                    else:
+                        print(".", end="")
                     valid_mb_count += 1
             except StopIteration:
                 pass
+            print(" ")
             mean_epoch_train_cost = np.mean(train_costs)
             mean_epoch_valid_cost = np.mean(valid_costs)
+            # np.inf trick to avoid taking the min of length 0 list
+            new_min_train_cost = min(overall_train_costs + [np.inf])
+            new_min_valid_cost = min(overall_valid_costs + [np.inf])
             overall_train_costs.append(mean_epoch_train_cost)
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
-            script = os.path.realpath(__file__)
-            print("Script %s" % script)
+            script = os.path.abspath(inspect.stack()[0][1])
+            print("script %s" % script)
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
             print("epoch mean valid cost %f" % mean_epoch_valid_cost)
             print("overall train costs %s" % overall_train_costs[-5:])
             print("overall valid costs %s" % overall_valid_costs[-5:])
-            if ((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
+
+            results_dict = {k: v for k, v in checkpoint_dict.items()
+                            if k not in ignore_keys}
+            # Always save latest
+            results_save_path = "%s_most_recent_results_%i.html" % (ident, e)
+            save_results_as_html(results_save_path, results_dict)
+
+            if e < checkpoint_delay:
+                if new_min_train_cost < min_train_cost:
+                    min_train_cost = new_min_train_cost
+                if new_min_valid_cost < min_valid_cost:
+                    min_valid_cost = new_min_valid_cost
+                continue
+            elif mean_epoch_valid_cost < min_valid_cost:
+                print("Checkpointing valid min...")
+                min_valid_cost = new_min_valid_cost
+                # If train is better update that too
+                if new_min_train_cost < min_train_cost:
+                    min_train_cost = new_min_train_cost
+                checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
+                weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
+                results_save_path = "%s_model_results_valid_%i.html" % (ident, e)
+                save_checkpoint(checkpoint_save_path, checkpoint_dict)
+                save_weights(weights_save_path, checkpoint_dict)
+                save_results_as_html(results_save_path, results_dict)
+            elif mean_epoch_train_cost < min_train_cost:
+                print("Checkpointing train min...")
+                min_train_cost = new_min_train_cost
+                checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
+                weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
+                results_save_path = "%s_model_results_train_%i.html" % (ident, e)
+                save_checkpoint(checkpoint_save_path, checkpoint_dict)
+                save_weights(weights_save_path, checkpoint_dict)
+                save_results_as_html(results_save_path, results_dict)
+            elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
                 print("Checkpointing...")
                 checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
+                results_save_path = "%s_model_results_%i.html" % (ident, e)
                 save_checkpoint(checkpoint_save_path, checkpoint_dict)
                 save_weights(weights_save_path, checkpoint_dict)
+                save_results_as_html(results_save_path, results_dict)
 """
 end training utilities
 """
