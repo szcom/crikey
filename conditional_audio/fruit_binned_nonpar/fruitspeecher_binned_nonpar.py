@@ -485,63 +485,56 @@ if __name__ == "__main__":
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
 
-    train_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
-                                      init_h1, init_h2, init_h3, init_kappa,
-                                      init_w],
-                                     [cost, h1, h2, h3, kappa, w],
-                                     updates=updates)
-    cost_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
-                                     init_h1, init_h2, init_h3, init_kappa,
-                                     init_w],
-                                    [cost, h1, h2, h3, kappa, w])
-    predict_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
-                                        init_h1, init_h2, init_h3, init_kappa,
-                                        init_w],
-                                       [outs],
-                                       on_unused_input='warn')
-    attention_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
-                                          init_h1, init_h2, init_h3, init_kappa,
-                                          init_w],
-                                         [kappa, w], on_unused_input='warn')
-    sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
-                                       init_h3, init_kappa, init_w,
-                                       n_steps_sym],
-                                      [sampled, h1_s, h2_s, h3_s, k_s, w_s,
-                                       stop_s, stop_h],
-                                      updates=supdates)
-
-    checkpoint_dict = {}
-    checkpoint_dict["train_function"] = train_function
-    checkpoint_dict["cost_function"] = cost_function
-    checkpoint_dict["predict_function"] = predict_function
-    checkpoint_dict["attention_function"] = attention_function
-    checkpoint_dict["sample_function"] = sample_function
-
-    print("Beginning training loop")
-    # These currently aren't being passed...
-    train_mb_count = 0
-    valid_mb_count = 0
-    start_epoch = 0
-    monitor_frequency = 1000 // minibatch_size
-    overall_train_costs = []
-    overall_valid_costs = []
-
     if args.cont is not None:
+        print("Continuing training from saved model")
         continue_path = args.cont
         if not os.path.exists(continue_path):
             raise ValueError("Continue model %s, path not "
                              "found" % continue_path)
         saved_checkpoint = load_checkpoint(continue_path)
+        checkpoint_dict = saved_checkpoint
+        train_function = checkpoint_dict["train_function"]
+        cost_function = checkpoint_dict["cost_function"]
+        predict_function = checkpoint_dict["predict_function"]
+        attention_function = checkpoint_dict["attention_function"]
+        sample_function = checkpoint_dict["sample_function"]
+        """
         trained_weights = get_values_from_function(
             saved_checkpoint["train_function"])
         set_shared_variables_in_function(train_function, trained_weights)
-        try:
-            overall_train_costs = saved_checkpoint["overall_train_costs"]
-            overall_valid_costs = saved_checkpoint["overall_valid_costs"]
-            start_epoch = len(overall_train_costs)
-        except KeyError:
-            print("Key not found - model structure may have changed.")
-            print("Continuing anyways - statistics may not be correct!")
+        """
+    else:
+        train_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
+                                          init_h1, init_h2, init_h3, init_kappa,
+                                          init_w],
+                                         [cost, h1, h2, h3, kappa, w],
+                                         updates=updates)
+        cost_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
+                                         init_h1, init_h2, init_h3, init_kappa,
+                                         init_w],
+                                        [cost, h1, h2, h3, kappa, w])
+        predict_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
+                                            init_h1, init_h2, init_h3, init_kappa,
+                                            init_w],
+                                           [outs],
+                                           on_unused_input='warn')
+        attention_function = theano.function([X_sym, X_mask_sym, c_sym, c_mask_sym,
+                                              init_h1, init_h2, init_h3, init_kappa,
+                                              init_w],
+                                             [kappa, w], on_unused_input='warn')
+        sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
+                                           init_h3, init_kappa, init_w,
+                                           n_steps_sym],
+                                          [sampled, h1_s, h2_s, h3_s, k_s, w_s,
+                                           stop_s, stop_h],
+                                          updates=supdates)
+        print("Beginning training loop")
+        checkpoint_dict = {}
+        checkpoint_dict["train_function"] = train_function
+        checkpoint_dict["cost_function"] = cost_function
+        checkpoint_dict["predict_function"] = predict_function
+        checkpoint_dict["attention_function"] = attention_function
+        checkpoint_dict["sample_function"] = sample_function
 
 
     def _loop(function, itr):

@@ -3640,9 +3640,8 @@ def run_loop(loop_function, train_function, train_itr,
     """
     loop function should return a list of costs
 
-    TODO: handle case when cost is negative...
-    TODO: checkpoint on /Tmp for MILA? Or make dedicated writer thread...
     TODO: fix key handling for continued training
+    TODO: checkpoint on /Tmp for MILA? Or make dedicated writer thread...
     """
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
@@ -3655,37 +3654,95 @@ def run_loop(loop_function, train_function, train_itr,
     random_state = np.random.RandomState(2177)
     monitor_prob = 1. / monitor_frequency
 
-    train_cost_to_beat = np.inf
-    tcf = train_cost_fraction
-    tcfi = train_cost_fraction_increment
+    non_ignored_keys = [k for k in checkpoint_dict.keys()
+                        if k not in ignore_keys]
+    if len(non_ignored_keys) > 0:
+        overall_train_costs = checkpoint_dict["train_costs"]
+        overall_valid_costs = checkpoint_dict["valid_costs"]
+        # Auto tracking times
+        overall_epoch_deltas = checkpoint_dict["epoch_deltas_auto"]
+        overall_epoch_times = checkpoint_dict["epoch_times_auto"]
+        overall_train_deltas = checkpoint_dict["train_deltas_auto"]
+        overall_train_times = checkpoint_dict["train_times_auto"]
+        overall_valid_deltas = checkpoint_dict["valid_deltas_auto"]
+        overall_valid_times = checkpoint_dict["valid_times_auto"]
+        overall_checkpoint_deltas = checkpoint_dict["checkpoint_deltas_auto"]
+        overall_checkpoint_times = checkpoint_dict["checkpoint_times_auto"]
+        overall_joint_deltas = checkpoint_dict["joint_deltas_auto"]
+        overall_joint_times = checkpoint_dict["joint_times_auto"]
+        # Auto tracking fraction
+        overall_train_to_beat = checkpoint_dict["train_to_beat_auto"]
+        overall_valid_to_beat = checkpoint_dict["valid_to_beat_auto"]
+        overall_train_fractions = checkpoint_dict["train_fractions_auto"]
+        overall_valid_fractions = checkpoint_dict["valid_fractions_auto"]
+        keys_checked = ["train_costs",
+                        "valid_costs",
+                        "epoch_deltas_auto",
+                        "epoch_times_auto",
+                        "train_deltas_auto",
+                        "train_times_auto",
+                        "valid_deltas_auto",
+                        "valid_times_auto",
+                        "checkpoint_deltas_auto",
+                        "checkpoint_times_auto",
+                        "joint_deltas_auto",
+                        "joint_times_auto",
+                        "train_to_beat_auto",
+                        "valid_to_beat_auto",
+                        "train_fractions_auto",
+                        "valid_fractions_auto"]
+        not_handled = [k for k in checkpoint_dict.keys()
+                       if k not in keys_checked and k not in ignore_keys]
+        if len(not_handled) > 0:
+            raise ValueError("Unhandled keys %s in checkpoint_dict, exiting..." % not_handled)
 
-    valid_cost_to_beat = np.inf
-    vcf = valid_cost_fraction
-    vcfi = valid_cost_fraction_increment
+        epoch_time_total = overall_epoch_times[-1]
+        train_time_total = overall_train_times[-1]
+        valid_time_total = overall_valid_times[-1]
+        checkpoint_time_total = overall_checkpoint_times[-1]
+        joint_time_total = overall_joint_times[-1]
 
-    start_epoch = 0
-    overall_train_costs = []
-    overall_valid_costs = []
-    overall_train_to_beat = []
-    overall_valid_to_beat = []
+        start_epoch = len(overall_train_costs)
+        train_cost_to_beat = overall_train_to_beat[-1]
+        valid_cost_to_beat = overall_valid_to_beat[-1]
 
-    epoch_time_total = 0
-    train_time_total = 0
-    valid_time_total = 0
-    checkpoint_time_total = 0
-    joint_time_total = 0
-    overall_epoch_times = []
-    overall_epoch_deltas = []
-    overall_train_times = []
-    overall_train_deltas = []
-    overall_valid_times = []
-    overall_valid_deltas = []
-    # Add zeros to avoid errors
-    overall_checkpoint_times = [0]
-    overall_checkpoint_deltas = [0]
-    overall_joint_times = [0]
-    overall_joint_deltas = [0]
+        tcf = overall_train_fractions[-1]
+        tcfi = train_cost_fraction_increment
+        vcf = overall_valid_fractions[-1]
+        vcfi = valid_cost_fraction_increment
+    else:
+        overall_train_costs = []
+        overall_valid_costs = []
+        overall_train_to_beat = []
+        overall_valid_to_beat = []
+        overall_train_fractions = []
+        overall_valid_fractions = []
 
+        epoch_time_total = 0
+        train_time_total = 0
+        valid_time_total = 0
+        checkpoint_time_total = 0
+        joint_time_total = 0
+        overall_epoch_times = []
+        overall_epoch_deltas = []
+        overall_train_times = []
+        overall_train_deltas = []
+        overall_valid_times = []
+        overall_valid_deltas = []
+        # Add zeros to avoid errors
+        overall_checkpoint_times = [0]
+        overall_checkpoint_deltas = [0]
+        overall_joint_times = [0]
+        overall_joint_deltas = [0]
+
+        start_epoch = 0
+        train_cost_to_beat = np.inf
+        valid_cost_to_beat = np.inf
+
+        tcf = train_cost_fraction
+        tcfi = train_cost_fraction_increment
+        vcf = valid_cost_fraction
+        vcfi = valid_cost_fraction_increment
 
     for e in range(start_epoch, start_epoch + n_epochs):
         joint_start = time.time()
@@ -3735,6 +3792,7 @@ def run_loop(loop_function, train_function, train_itr,
             valid_stop = time.time()
             epoch_stop = time.time()
 
+            # Logging and tracking training statistics
             epoch_time_delta = epoch_stop - epoch_start
             epoch_time_total += epoch_time_delta
             overall_epoch_deltas.append(epoch_time_delta)
@@ -3767,23 +3825,33 @@ def run_loop(loop_function, train_function, train_itr,
 
             # Control part for exponential backoff
             tcf = tcfi * tcf
-            if tcf > train_cost_fraction:
-                tcf = train_cost_fraction
             vcf = vcfi * vcf
-            if vcf > valid_cost_fraction:
-                vcf = valid_cost_fraction
 
-            if len(overall_train_costs) < 2:
-                # Edge case for 1st epoch
+            if train_cost_to_beat < 0 and tcf < 1:
+                # if cost is < 0 logic has to change
+                tcf = 1 + (1 - tcf)
+            elif tcf > train_cost_fraction:
+                tcf = train_cost_fraction
+            overall_train_fractions.append(tcf)
+
+            if valid_cost_to_beat < 0 and vcf < 1:
+                # if cost is < 0 logic has to change
+                vcf = 1 + (1 - vcf)
+            elif vcf > valid_cost_fraction:
+                vcf = valid_cost_fraction
+            overall_valid_fractions.append(vcf)
+
+            if np.isinf(train_cost_to_beat):
+                # Edge case before first min
                 overall_train_to_beat.append(mean_epoch_train_cost)
             else:
-                overall_train_to_beat.append(tcf * new_min_train_cost)
+                overall_train_to_beat.append(tcf * train_cost_to_beat)
 
-            if len(overall_valid_costs) < 2:
-                # Edge case for either first epoch or no valid set
+            if np.isinf(valid_cost_to_beat):
+                # Edge case before first min
                 overall_valid_to_beat.append(mean_epoch_valid_cost)
             else:
-                overall_valid_to_beat.append(vcf * new_min_train_cost)
+                overall_valid_to_beat.append(vcf * valid_cost_to_beat)
 
             checkpoint_dict["train_costs"] = overall_train_costs
             checkpoint_dict["valid_costs"] = overall_valid_costs
@@ -3801,6 +3869,8 @@ def run_loop(loop_function, train_function, train_itr,
             # Auto tracking fraction
             checkpoint_dict["train_to_beat_auto"] = overall_train_to_beat
             checkpoint_dict["valid_to_beat_auto"] = overall_valid_to_beat
+            checkpoint_dict["train_fractions_auto"] = overall_train_fractions
+            checkpoint_dict["valid_fractions_auto"] = overall_valid_fractions
 
             script = os.path.abspath(inspect.stack()[0][1])
             print("script %s" % script)
@@ -3813,11 +3883,12 @@ def run_loop(loop_function, train_function, train_itr,
             results_dict = {k: v for k, v in checkpoint_dict.items()
                             if k not in ignore_keys}
 
+            # Checkpointing part
             checkpoint_start = time.time()
             if e < checkpoint_delay:
                 print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
                 print("Continuing without checkpoint")
-            elif abs(mean_epoch_valid_cost / valid_cost_to_beat) < valid_cost_fraction:
+            elif mean_epoch_valid_cost < vcf * valid_cost_to_beat:
                 print("Checkpointing valid...")
                 valid_cost_to_beat = new_min_valid_cost
                 vcf = vcf ** 2
@@ -3831,7 +3902,7 @@ def run_loop(loop_function, train_function, train_itr,
                 save_checkpoint(checkpoint_save_path, checkpoint_dict)
                 save_weights(weights_save_path, checkpoint_dict)
                 save_results_as_html(results_save_path, results_dict)
-            elif abs(mean_epoch_train_cost / train_cost_to_beat) < train_cost_fraction:
+            elif mean_epoch_train_cost < tcf * train_cost_to_beat:
                 print("Checkpointing train...")
                 tcf = tcf ** 2
                 train_cost_to_beat = new_min_train_cost
