@@ -3772,12 +3772,7 @@ def run_loop(loop_function, train_function, train_itr,
                             if k not in ignore_keys}
 
             checkpoint_start = time.time()
-            if e < checkpoint_delay:
-                if new_min_train_cost < min_train_cost:
-                    min_train_cost = new_min_train_cost
-                if new_min_valid_cost < min_valid_cost:
-                    min_valid_cost = new_min_valid_cost
-            elif mean_epoch_valid_cost < min_valid_cost:
+            if mean_epoch_valid_cost < min_valid_cost:
                 print("Checkpointing valid...")
                 min_valid_cost = new_min_valid_cost
                 # If train is better update that too
@@ -3789,6 +3784,11 @@ def run_loop(loop_function, train_function, train_itr,
                 save_checkpoint(checkpoint_save_path, checkpoint_dict)
                 save_weights(weights_save_path, checkpoint_dict)
                 save_results_as_html(results_save_path, results_dict)
+            elif e < checkpoint_delay:
+                if new_min_train_cost < min_train_cost:
+                    min_train_cost = new_min_train_cost
+                if new_min_valid_cost < min_valid_cost:
+                    min_valid_cost = new_min_valid_cost
             elif mean_epoch_train_cost < min_train_cost:
                 print("Checkpointing train...")
                 min_train_cost = new_min_train_cost
