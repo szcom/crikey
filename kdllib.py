@@ -3772,7 +3772,8 @@ def run_loop(loop_function, train_function, train_itr,
                             if k not in ignore_keys}
 
             checkpoint_start = time.time()
-            if mean_epoch_valid_cost < min_valid_cost:
+            # > 2 to make sure there at least 3 points to form a trend
+            if mean_epoch_valid_cost < min_valid_cost and e > 2:
                 print("Checkpointing valid...")
                 min_valid_cost = new_min_valid_cost
                 # If train is better update that too
