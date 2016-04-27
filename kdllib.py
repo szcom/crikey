@@ -3640,8 +3640,7 @@ def run_loop(loop_function, train_function, train_itr,
     """
     loop function should return a list of costs
 
-    TODO: fix key handling for continued training
-    TODO: checkpoint on /Tmp for MILA? Or make dedicated writer thread...
+    TODO: make dedicated writer thread or coroutine...
     """
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
