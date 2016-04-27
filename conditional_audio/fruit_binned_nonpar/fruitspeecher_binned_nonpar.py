@@ -36,8 +36,7 @@ if __name__ == "__main__":
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
     minibatch_size = 20
-    n_epochs = 200  # Used way at the bottom in the training loop!
-    checkpoint_every_n = 50
+    n_epochs = 20000  # Used way at the bottom in the training loop!
     # Was 300
     cut_len = 41  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
@@ -53,7 +52,7 @@ if __name__ == "__main__":
     input_dim = X_mb.shape[-1]
     n_hid = 512
     att_size = 10
-    n_proj =  1024
+    n_proj = 1024
     n_softmax1 = X1_size
     n_softmax2 = X2_size
     n_chars = vocabulary_size
