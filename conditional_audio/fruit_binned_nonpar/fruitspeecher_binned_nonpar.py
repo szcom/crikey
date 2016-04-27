@@ -37,6 +37,7 @@ if __name__ == "__main__":
 
     minibatch_size = 20
     n_epochs = 20000  # Used way at the bottom in the training loop!
+    checkpoint_every_n = 500
     # Was 300
     cut_len = 41  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
@@ -585,4 +586,5 @@ if __name__ == "__main__":
         return partial_costs
 
 run_loop(_loop, train_function, train_itr, cost_function, valid_itr,
-         n_epochs=n_epochs, checkpoint_dict=checkpoint_dict)
+         n_epochs=n_epochs, checkpoint_dict=checkpoint_dict,
+         checkpoint_every_n=checkpoint_every_n)

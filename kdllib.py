@@ -3632,18 +3632,16 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
-             checkpoint_time_fraction=.05, checkpoint_delay=100,
-             start_epoch=0, monitor_frequency=1000):
+             checkpoint_delay=10, checkpoint_every_n=100, start_epoch=0,
+             monitor_frequency=100):
     """
     loop function should return a list of costs
 
-    TODO: Make checkpoint time be *at most* X% overall runtime
     TODO: fix ignore_keys checking to allow train restart
-    TODO: checkpoint on /Tmp for MILA?
+    TODO: checkpoint on /Tmp for MILA? Or make dedicated writer thread...
     """
     # Assume these keys are all theano functions to ignore!
     ignore_keys = checkpoint_dict.keys()
-    checkpoint_every_n = 100
 
     _loop = loop_function
     ident = str(uuid.uuid4())[:8]
@@ -3652,10 +3650,22 @@ def run_loop(loop_function, train_function, train_itr,
     random_state = np.random.RandomState(2177)
     monitor_prob = 1. / monitor_frequency
 
-    min_train_cost = np.inf
-    min_valid_cost = np.inf
+    train_cost_to_beat = np.inf
+    train_cost_fraction = .95
+    train_cost_fraction_increment = 1.01
+    tcf = train_cost_fraction
+    tcfi = train_cost_fraction_increment
+
+    valid_cost_to_beat = np.inf
+    valid_cost_fraction = .95
+    valid_cost_fraction_increment = 1.01
+    vcf = valid_cost_fraction
+    vcfi = valid_cost_fraction_increment
+
     overall_train_costs = []
     overall_valid_costs = []
+    overall_train_to_beat = []
+    overall_valid_to_beat = []
 
     epoch_time_total = 0
     train_time_total = 0
@@ -3673,6 +3683,7 @@ def run_loop(loop_function, train_function, train_itr,
     overall_checkpoint_deltas = [0]
     overall_joint_times = [0]
     overall_joint_deltas = [0]
+
 
     for e in range(start_epoch, start_epoch + n_epochs):
         joint_start = time.time()
@@ -3740,11 +3751,37 @@ def run_loop(loop_function, train_function, train_itr,
             mean_epoch_train_cost = np.mean(train_costs)
             # np.inf trick to avoid taking the min of length 0 list
             new_min_train_cost = min(overall_train_costs + [np.inf])
+            if np.isnan(mean_epoch_train_cost):
+                print("previous train costs %s" % overall_train_costs[-5:])
+                raise ValueError("NaN detected in train cost, epoch %i" % e)
             overall_train_costs.append(mean_epoch_train_cost)
 
             mean_epoch_valid_cost = np.mean(valid_costs)
             new_min_valid_cost = min(overall_valid_costs + [np.inf])
+            if np.isnan(mean_epoch_valid_cost):
+                print("previous valid costs %s" % overall_valid_costs[-5:])
+                raise ValueError("NaN detected in valid cost, epoch %i" % e)
             overall_valid_costs.append(mean_epoch_valid_cost)
+
+            # Control part for exponential backoff
+            tcf = tcfi * tcf
+            if tcf > train_cost_fraction:
+                tcf = train_cost_fraction
+            vcf = vcfi * vcf
+            if vcf > valid_cost_fraction:
+                vcf = valid_cost_fraction
+
+            if len(overall_train_costs) < 2:
+                # Edge case for 1st epoch
+                overall_train_to_beat.append(mean_epoch_train_cost)
+            else:
+                overall_train_to_beat.append(tcf * new_min_train_cost)
+
+            if len(overall_valid_costs) < 2:
+                # Edge case for either first epoch or no valid set
+                overall_valid_to_beat.append(mean_epoch_valid_cost)
+            else:
+                overall_valid_to_beat.append(vcf * new_min_train_cost)
 
             checkpoint_dict["train_costs"] = overall_train_costs
             checkpoint_dict["valid_costs"] = overall_valid_costs
@@ -3759,6 +3796,9 @@ def run_loop(loop_function, train_function, train_itr,
             checkpoint_dict["checkpoint_times_auto"] = overall_checkpoint_times
             checkpoint_dict["joint_deltas_auto"] = overall_joint_deltas
             checkpoint_dict["joint_times_auto"] = overall_joint_times
+            # Auto tracking fraction
+            checkpoint_dict["train_to_beat_auto"] = overall_train_to_beat
+            checkpoint_dict["valid_to_beat_auto"] = overall_valid_to_beat
 
             script = os.path.abspath(inspect.stack()[0][1])
             print("script %s" % script)
@@ -3772,27 +3812,27 @@ def run_loop(loop_function, train_function, train_itr,
                             if k not in ignore_keys}
 
             checkpoint_start = time.time()
-            # > 2 to make sure there at least 3 points to form a trend
-            if mean_epoch_valid_cost < min_valid_cost and e > 2:
+            if e < checkpoint_delay:
+                print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
+                print("Continuing without checkpoint")
+            elif abs(mean_epoch_valid_cost / valid_cost_to_beat) < valid_cost_fraction:
                 print("Checkpointing valid...")
-                min_valid_cost = new_min_valid_cost
+                valid_cost_to_beat = new_min_valid_cost
+                vcf = vcf ** 2
                 # If train is better update that too
-                if new_min_train_cost < min_train_cost:
-                    min_train_cost = new_min_train_cost
+                if new_min_train_cost < train_cost_to_beat:
+                    tcf = tcf ** 2
+                    train_cost_to_beat = new_min_train_cost
                 checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_valid_%i.html" % (ident, e)
                 save_checkpoint(checkpoint_save_path, checkpoint_dict)
                 save_weights(weights_save_path, checkpoint_dict)
                 save_results_as_html(results_save_path, results_dict)
-            elif e < checkpoint_delay:
-                if new_min_train_cost < min_train_cost:
-                    min_train_cost = new_min_train_cost
-                if new_min_valid_cost < min_valid_cost:
-                    min_valid_cost = new_min_valid_cost
-            elif mean_epoch_train_cost < min_train_cost:
+            elif abs(mean_epoch_train_cost / train_cost_to_beat) < train_cost_fraction:
                 print("Checkpointing train...")
-                min_train_cost = new_min_train_cost
+                tcf = tcf ** 2
+                train_cost_to_beat = new_min_train_cost
                 checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_train_%i.html" % (ident, e)
