@@ -386,9 +386,9 @@ if __name__ == "__main__":
         pred1_t = softmax(l2_t.dot(softmax1_proj) + softmax1_b)
         pred2_t = softmax(l2_t.dot(softmax2_proj) + softmax2_b)
 
-        s1_t = sample_softmax(pred1_t, srng, debug=True)
+        s1_t = sample_softmax(pred1_t, srng)
         theano.printing.Print("s1_t.shape")(s1_t.shape)
-        s2_t = sample_softmax(pred2_t, srng, debug=True)
+        s2_t = sample_softmax(pred2_t, srng)
         theano.printing.Print("s2_t.shape")(s2_t.shape)
         s1_t = s1_t.dimshuffle(0, 'x')
         theano.printing.Print("s1_t.shape")(s1_t.shape)
