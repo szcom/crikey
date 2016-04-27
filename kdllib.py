@@ -3504,6 +3504,7 @@ def set_shared_variables_in_function(func, list_of_values):
 
 
 def save_weights(save_weights_path, items_dict):
+    return
     print("Saving weights to %s" % save_weights_path)
     weights_dict = {}
     # k is the function name, v is a theano function
@@ -3632,16 +3633,20 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
-             checkpoint_delay=10, checkpoint_every_n=100, start_epoch=0,
-             monitor_frequency=100):
+             checkpoint_delay=10, checkpoint_every_n=100,
+             monitor_frequency=100, train_cost_fraction=.9,
+             train_cost_fraction_increment=1.01,
+             valid_cost_fraction=0.95, valid_cost_fraction_increment=1.02):
     """
     loop function should return a list of costs
 
-    TODO: fix ignore_keys checking to allow train restart
+    TODO: handle case when cost is negative...
     TODO: checkpoint on /Tmp for MILA? Or make dedicated writer thread...
+    TODO: fix key handling for continued training
     """
-    # Assume these keys are all theano functions to ignore!
-    ignore_keys = checkpoint_dict.keys()
+    # Assume keys which are theano functions to ignore!
+    ignore_keys = [k for k, v in checkpoint_dict.items()
+                   if isinstance(v, theano.compile.function_module.Function)]
 
     _loop = loop_function
     ident = str(uuid.uuid4())[:8]
@@ -3651,17 +3656,14 @@ def run_loop(loop_function, train_function, train_itr,
     monitor_prob = 1. / monitor_frequency
 
     train_cost_to_beat = np.inf
-    train_cost_fraction = .95
-    train_cost_fraction_increment = 1.01
     tcf = train_cost_fraction
     tcfi = train_cost_fraction_increment
 
     valid_cost_to_beat = np.inf
-    valid_cost_fraction = .95
-    valid_cost_fraction_increment = 1.01
     vcf = valid_cost_fraction
     vcfi = valid_cost_fraction_increment
 
+    start_epoch = 0
     overall_train_costs = []
     overall_valid_costs = []
     overall_train_to_beat = []
