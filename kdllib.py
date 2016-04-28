@@ -3534,11 +3534,11 @@ def save_weights(save_weights_path, items_dict):
               "unable to save weights!")
 
 @coroutine
-def threaded_weights_writer():
+def threaded_weights_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
-    messages = Queue.Queue()
+    messages = Queue.LifoQueue(maxsize=maxsize)
     def run_thread():
         while True:
             item = messages.get()
@@ -3566,11 +3566,11 @@ def save_checkpoint(save_path, pickle_item):
 
 
 @coroutine
-def threaded_checkpoint_writer():
+def threaded_checkpoint_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
-    messages = Queue.Queue()
+    messages = Queue.LifoQueue(maxsize=maxsize)
     def run_thread():
         while True:
             item = messages.get()
@@ -3664,11 +3664,11 @@ def save_results_as_html(save_path, results_dict, default_no_show="_auto"):
 
 
 @coroutine
-def threaded_html_writer():
+def threaded_html_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, results_dict)
     """
-    messages = Queue.Queue()
+    messages = Queue.LifoQueue(maxsize=maxsize)
     def run_thread():
         while True:
             item = messages.get()
@@ -3717,7 +3717,7 @@ def implot(arr, title="", cmap="gray", save_name=None):
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
              checkpoint_delay=10, checkpoint_every_n=100,
-             monitor_frequency=100, train_cost_fraction=.9,
+             monitor_frequency=100, train_cost_fraction=.8,
              train_cost_fraction_increment=1.01,
              valid_cost_fraction=0.95, valid_cost_fraction_increment=1.02):
     """
