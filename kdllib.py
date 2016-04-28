@@ -38,6 +38,18 @@ except ImportError:
     import urllib2 as urllib
 
 """
+begin decorators
+"""
+def coroutine(func):
+    def start(*args,**kwargs):
+        cr = func(*args,**kwargs)
+        cr.next()
+        return cr
+    return start
+"""
+end decorators
+"""
+"""
 begin datasets
 """
 def soundsc(X, copy=True):
@@ -3504,6 +3516,7 @@ def set_shared_variables_in_function(func, list_of_values):
 
 
 def save_weights(save_weights_path, items_dict):
+    print("Not saving weights due to copy issues in npz")
     return
     print("Saving weights to %s" % save_weights_path)
     weights_dict = {}
@@ -3520,8 +3533,31 @@ def save_weights(save_weights_path, items_dict):
         print("Possible BUG: no theano functions found in items_dict, "
               "unable to save weights!")
 
+@coroutine
+def threaded_weights_writer():
+    """
+    Expects to be sent a tuple of (save_path, checkpoint_dict)
+    """
+    messages = Queue.Queue()
+    def run_thread():
+        while True:
+            item = messages.get()
+            if item is GeneratorExit:
+                return
+            else:
+                save_path, items_dict = item
+                save_weights(save_path, items_dict)
+    threading.Thread(target=run_thread).start()
+    try:
+        while True:
+            item = (yield)
+            messages.put(item)
+    except GeneratorExit:
+        messages.put(GeneratorExit)
+
 
 def save_checkpoint(save_path, pickle_item):
+    print("Saving checkpoint to %s" % save_path)
     old_recursion_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(40000)
     with open(save_path, mode="wb") as f:
@@ -3529,7 +3565,31 @@ def save_checkpoint(save_path, pickle_item):
     sys.setrecursionlimit(old_recursion_limit)
 
 
+@coroutine
+def threaded_checkpoint_writer():
+    """
+    Expects to be sent a tuple of (save_path, checkpoint_dict)
+    """
+    messages = Queue.Queue()
+    def run_thread():
+        while True:
+            item = messages.get()
+            if item is GeneratorExit:
+                return
+            else:
+                save_path, pickle_item = item
+                save_checkpoint(save_path, pickle_item)
+    threading.Thread(target=run_thread).start()
+    try:
+        while True:
+            item = (yield)
+            messages.put(item)
+    except GeneratorExit:
+        messages.put(GeneratorExit)
+
+
 def load_checkpoint(saved_checkpoint_path):
+    print("Loading checkpoint from %s" % saved_checkpoint_path)
     old_recursion_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(40000)
     with open(saved_checkpoint_path, mode="rb") as f:
@@ -3596,11 +3656,34 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
 
 def save_results_as_html(save_path, results_dict, default_no_show="_auto"):
     show_keys = [k for k in results_dict.keys()
-                 if "_auto" not in k]
+                 if default_no_show not in k]
     as_html = filled_js_template_from_results_dict(
         results_dict, default_show=show_keys)
     with open(save_path, "w") as f:
         f.writelines(as_html)
+
+
+@coroutine
+def threaded_html_writer():
+    """
+    Expects to be sent a tuple of (save_path, results_dict)
+    """
+    messages = Queue.Queue()
+    def run_thread():
+        while True:
+            item = messages.get()
+            if item is GeneratorExit:
+                return
+            else:
+                save_path, results_dict = item
+                save_results_as_html(save_path, results_dict)
+    threading.Thread(target=run_thread).start()
+    try:
+        while True:
+            item = (yield)
+            messages.put(item)
+    except GeneratorExit:
+        messages.put(GeneratorExit)
 
 
 def implot(arr, title="", cmap="gray", save_name=None):
@@ -3639,8 +3722,6 @@ def run_loop(loop_function, train_function, train_itr,
              valid_cost_fraction=0.95, valid_cost_fraction_increment=1.02):
     """
     loop function should return a list of costs
-
-    TODO: make dedicated writer thread or coroutine...
     """
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
@@ -3743,6 +3824,9 @@ def run_loop(loop_function, train_function, train_itr,
         vcf = valid_cost_fraction
         vcfi = valid_cost_fraction_increment
 
+    tcw = threaded_checkpoint_writer()
+    tww = threaded_weights_writer()
+    thw = threaded_html_writer()
     for e in range(start_epoch, start_epoch + n_epochs):
         joint_start = time.time()
         epoch_start = time.time()
@@ -3812,14 +3896,16 @@ def run_loop(loop_function, train_function, train_itr,
             new_min_train_cost = min(overall_train_costs + [np.inf])
             if np.isnan(mean_epoch_train_cost):
                 print("previous train costs %s" % overall_train_costs[-5:])
-                raise ValueError("NaN detected in train cost, epoch %i" % e)
+                print("NaN detected in train cost, epoch %i" % e)
+                break
             overall_train_costs.append(mean_epoch_train_cost)
 
             mean_epoch_valid_cost = np.mean(valid_costs)
             new_min_valid_cost = min(overall_valid_costs + [np.inf])
             if np.isnan(mean_epoch_valid_cost):
                 print("previous valid costs %s" % overall_valid_costs[-5:])
-                raise ValueError("NaN detected in valid cost, epoch %i" % e)
+                print("NaN detected in valid cost, epoch %i" % e)
+                break
             overall_valid_costs.append(mean_epoch_valid_cost)
 
             # Control part for exponential backoff
@@ -3898,9 +3984,9 @@ def run_loop(loop_function, train_function, train_itr,
                 checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_valid_%i.html" % (ident, e)
-                save_checkpoint(checkpoint_save_path, checkpoint_dict)
-                save_weights(weights_save_path, checkpoint_dict)
-                save_results_as_html(results_save_path, results_dict)
+                tcw.send((checkpoint_save_path, checkpoint_dict))
+                tww.send((weights_save_path, checkpoint_dict))
+                thw.send((results_save_path, results_dict))
             elif mean_epoch_train_cost < tcf * train_cost_to_beat:
                 print("Checkpointing train...")
                 tcf = tcf ** 2
@@ -3908,24 +3994,24 @@ def run_loop(loop_function, train_function, train_itr,
                 checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_train_%i.html" % (ident, e)
-                save_checkpoint(checkpoint_save_path, checkpoint_dict)
-                save_weights(weights_save_path, checkpoint_dict)
-                save_results_as_html(results_save_path, results_dict)
+                tcw.send((checkpoint_save_path, checkpoint_dict))
+                tww.send((weights_save_path, checkpoint_dict))
+                thw.send((results_save_path, results_dict))
             elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
                 print("Checkpointing...")
                 checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_%i.html" % (ident, e)
-                save_checkpoint(checkpoint_save_path, checkpoint_dict)
-                save_weights(weights_save_path, checkpoint_dict)
-                save_results_as_html(results_save_path, results_dict)
+                tcw.send((checkpoint_save_path, checkpoint_dict))
+                tww.send((weights_save_path, checkpoint_dict))
+                thw.send((results_save_path, results_dict))
 
             checkpoint_stop = time.time()
             joint_stop = time.time()
 
             # Always save latest
             results_save_path = "%s_most_recent_results.html" % ident
-            save_results_as_html(results_save_path, results_dict)
+            thw.send((results_save_path, results_dict))
 
             # Will show up next go around
             checkpoint_time_delta = checkpoint_stop - checkpoint_start
@@ -3937,6 +4023,9 @@ def run_loop(loop_function, train_function, train_itr,
             joint_time_total += joint_time_delta
             overall_joint_deltas.append(joint_time_delta)
             overall_joint_times.append(joint_time_total)
+    tcw.close()
+    tww.close()
+    thw.close()
 """
 end training utilities
 """
