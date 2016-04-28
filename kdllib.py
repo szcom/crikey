@@ -4023,6 +4023,7 @@ def run_loop(loop_function, train_function, train_itr,
             joint_time_total += joint_time_delta
             overall_joint_deltas.append(joint_time_delta)
             overall_joint_times.append(joint_time_total)
+    print("run_loop finished, closing write threads (this may take a while!")
     tcw.close()
     tww.close()
     thw.close()
