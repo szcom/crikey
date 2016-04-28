@@ -49,6 +49,7 @@ def coroutine(func):
 """
 end decorators
 """
+
 """
 begin datasets
 """
@@ -3538,10 +3539,10 @@ def threaded_weights_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
-    messages = Queue.LifoQueue(maxsize=maxsize)
+    messages = Queue.PriorityQueue(maxsize=maxsize)
     def run_thread():
         while True:
-            item = messages.get()
+            p, item = messages.get()
             if item is GeneratorExit:
                 return
             else:
@@ -3549,11 +3550,13 @@ def threaded_weights_writer(maxsize=10):
                 save_weights(save_path, items_dict)
     threading.Thread(target=run_thread).start()
     try:
+        n = 0
         while True:
             item = (yield)
-            messages.put(item)
+            messages.put((n, item))
+            n -= 1
     except GeneratorExit:
-        messages.put(GeneratorExit)
+        messages.put((1, GeneratorExit))
 
 
 def save_checkpoint(save_path, pickle_item):
@@ -3570,10 +3573,10 @@ def threaded_checkpoint_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
-    messages = Queue.LifoQueue(maxsize=maxsize)
+    messages = Queue.PriorityQueue(maxsize=maxsize)
     def run_thread():
         while True:
-            item = messages.get()
+            p, item = messages.get()
             if item is GeneratorExit:
                 return
             else:
@@ -3581,11 +3584,13 @@ def threaded_checkpoint_writer(maxsize=10):
                 save_checkpoint(save_path, pickle_item)
     threading.Thread(target=run_thread).start()
     try:
+        n = 0
         while True:
             item = (yield)
-            messages.put(item)
+            messages.put((n, item))
+            n -= 1
     except GeneratorExit:
-        messages.put(GeneratorExit)
+        messages.put((1, GeneratorExit))
 
 
 def load_checkpoint(saved_checkpoint_path):
@@ -3668,22 +3673,25 @@ def threaded_html_writer(maxsize=10):
     """
     Expects to be sent a tuple of (save_path, results_dict)
     """
-    messages = Queue.LifoQueue(maxsize=maxsize)
+    messages = Queue.PriorityQueue(maxsize=maxsize)
     def run_thread():
         while True:
-            item = messages.get()
+            p, item = messages.get()
             if item is GeneratorExit:
                 return
             else:
                 save_path, results_dict = item
                 save_results_as_html(save_path, results_dict)
+
     threading.Thread(target=run_thread).start()
     try:
+        n = 0
         while True:
             item = (yield)
-            messages.put(item)
+            messages.put((n, item))
+            n -= 1
     except GeneratorExit:
-        messages.put(GeneratorExit)
+        messages.put((1, GeneratorExit))
 
 
 def implot(arr, title="", cmap="gray", save_name=None):
@@ -4023,7 +4031,7 @@ def run_loop(loop_function, train_function, train_itr,
             joint_time_total += joint_time_delta
             overall_joint_deltas.append(joint_time_delta)
             overall_joint_times.append(joint_time_total)
-    print("run_loop finished, closing write threads (this may take a while!")
+    print("run_loop finished, closing write threads (this may take a while!)")
     tcw.close()
     tww.close()
     thw.close()
