@@ -131,50 +131,23 @@ if __name__ == "__main__":
                 c_mb_mask = np.ones_like(c_mb[:, :, 0])
 
             if args.sample_length is None:
-                # Automatic sampling stop as described in Graves' paper
-                # Assume an average of 30 timesteps per char
-                n_steps = 30 * c_mb.shape[0]
-                step_inc = n_steps
-                max_steps = 25000
-                max_steps_buf = max_steps + n_steps
-                completed = [np.zeros((max_steps_buf, X_mb.shape[-1]))
-                             for i in range(c_mb.shape[1])]
-                max_indices = [None] * c_mb.shape[1]
-                completed_indices = set()
-                # hardcoded upper limit
-                while n_steps < max_steps:
-                    rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                            prev_h3, prev_kappa, prev_w,
-                                            n_steps)
-                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                    for i in range(c_mb.shape[1]):
-                        max_ind = None
-                        for j in range(len(stop_s)):
-                            if np.all(stop_h[j, i] > stop_s[j, i]):
-                                max_ind = j
-
-                        if max_ind is not None:
-                            completed_indices = completed_indices | set([i])
-                            completed[i][:max_ind] = sampled[:max_ind, i]
-                            max_indices[i] = max_ind
-                    # if most samples meet the criteria call it good
-                    if len(completed_indices) >= .8 * c_mb.shape[1]:
-                        break
-                    n_steps += step_inc
-                print("Completed auto sampling after %i steps" % n_steps)
-                # cut out garbage
-                completed = [completed[i] for i in completed_indices]
-                cond = c_mb[:, np.array(list(completed_indices))]
+                raise ValueError("NYI - use -sl or --sample_length ")
             else:
                 fixed_steps = args.sample_length
-                rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                        prev_h3, prev_kappa, prev_w,
-                                        fixed_steps)
-                sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                completed = [sampled[:, i]
-                             for i in range(sampled.shape[1])]
+                completed = []
+                for i in range(fixed_steps):
+                    rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
+                                            prev_h3, prev_kappa, prev_w)
+                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
+                    completed.append(sampled)
+                    prev_h1 = h1_s
+                    prev_h2 = h2_s
+                    prev_h3 = h3_s
+                    prev_kappa = k_s
+                    prev_w = w_s
                 cond = c_mb
                 print("Completed sampling after %i steps" % fixed_steps)
+            completed = np.array(completed).transpose(1, 0, 2)
             rlookup = {v: k for k, v in vocabulary.items()}
             for i in range(len(completed)):
                 ex = completed[i]

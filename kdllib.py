@@ -3830,15 +3830,8 @@ def run_loop(loop_function, train_function, train_itr,
         overall_checkpoint_times = checkpoint_dict["checkpoint_times_auto"]
         overall_joint_deltas = checkpoint_dict["joint_deltas_auto"]
         overall_joint_times = checkpoint_dict["joint_times_auto"]
-        # Auto tracking fraction
-        overall_train_to_beat = checkpoint_dict["train_to_beat_auto"]
-        overall_valid_to_beat = checkpoint_dict["valid_to_beat_auto"]
-        overall_train_fractions = checkpoint_dict["train_fractions_auto"]
-        overall_valid_fractions = checkpoint_dict["valid_fractions_auto"]
         overall_train_checkpoint = checkpoint_dict["train_checkpoint_auto"]
         overall_valid_checkpoint = checkpoint_dict["valid_checkpoint_auto"]
-        overall_force_checkpoint = checkpoint_dict["force_checkpoint_auto"]
-        overall_joint_checkpoint = checkpoint_dict["joint_checkpoint_auto"]
         keys_checked = ["train_costs",
                         "valid_costs",
                         "epoch_deltas_auto",
@@ -3851,14 +3844,8 @@ def run_loop(loop_function, train_function, train_itr,
                         "checkpoint_times_auto",
                         "joint_deltas_auto",
                         "joint_times_auto",
-                        "train_to_beat_auto",
-                        "valid_to_beat_auto",
-                        "train_fractions_auto",
-                        "valid_fractions_auto",
                         "train_checkpoint_auto",
-                        "valid_checkpoint_auto",
-                        "force_checkpoint_auto",
-                        "joint_checkpoint_auto"]
+                        "valid_checkpoint_auto"]
         not_handled = [k for k in checkpoint_dict.keys()
                        if k not in keys_checked and k not in ignore_keys]
         if len(not_handled) > 0:
@@ -3871,22 +3858,11 @@ def run_loop(loop_function, train_function, train_itr,
         joint_time_total = overall_joint_times[-1]
 
         start_epoch = len(overall_train_costs)
-
-        tcf = overall_train_fractions[-1]
-        tcfi = train_cost_fraction_increment
-        vcf = overall_valid_fractions[-1]
-        vcfi = valid_cost_fraction_increment
     else:
         overall_train_costs = []
         overall_valid_costs = []
-        overall_train_to_beat = []
-        overall_valid_to_beat = []
-        overall_train_fractions = []
-        overall_valid_fractions = []
         overall_train_checkpoint = []
         overall_valid_checkpoint = []
-        overall_force_checkpoint = []
-        overall_joint_checkpoint = []
 
         epoch_time_total = 0
         train_time_total = 0
@@ -3906,225 +3882,207 @@ def run_loop(loop_function, train_function, train_itr,
         overall_joint_deltas = [0]
 
         start_epoch = 0
-        train_cost_to_beat = np.inf
-        valid_cost_to_beat = np.inf
-
-        tcf = train_cost_fraction
-        tcfi = train_cost_fraction_increment
-        vcf = valid_cost_fraction
-        vcfi = valid_cost_fraction_increment
 
     tcw = threaded_checkpoint_writer()
     tww = threaded_weights_writer()
     thw = threaded_html_writer()
-    for e in range(start_epoch, start_epoch + n_epochs):
-        joint_start = time.time()
-        epoch_start = time.time()
-        train_costs = []
-        print(" ")
-        print("starting training, epoch %i" % e)
-        print(" ")
-        try:
-            train_start = time.time()
-            while True:
-                partial_train_costs = _loop(train_function, train_itr)
-                train_costs.append(np.mean(partial_train_costs))
-                draw = random_state.rand()
-                if draw < monitor_prob:
-                    print(" ")
-                    print("starting train mb %i" % train_mb_count)
-                    print("current epoch mean cost %f" % np.mean(train_costs))
-                    print(" ")
-                else:
-                    print(".", end="")
-                train_mb_count += 1
-        except StopIteration:
-            train_stop = time.time()
-            valid_costs = []
+
+    best_train_checkpoint_pickle = None
+    best_train_checkpoint_epoch = 0
+    best_valid_checkpoint_pickle = None
+    best_train_checkpoint_epoch = 0
+    try:
+        for e in range(start_epoch, start_epoch + n_epochs):
+            joint_start = time.time()
+            epoch_start = time.time()
+            train_costs = []
             print(" ")
-            print("starting validation, epoch %i" % e)
+            print("starting training, epoch %i" % e)
             print(" ")
-            valid_start = time.time()
             try:
+                train_start = time.time()
                 while True:
-                    partial_valid_costs = _loop(valid_function, valid_itr)
-                    valid_costs.append(np.mean(partial_valid_costs))
+                    partial_train_costs = _loop(train_function, train_itr)
+                    train_costs.append(np.mean(partial_train_costs))
                     draw = random_state.rand()
                     if draw < monitor_prob:
                         print(" ")
-                        print("valid mb %i" % valid_mb_count)
-                        print("current validation mean cost %f" % np.mean(
-                            valid_costs))
+                        print("starting train mb %i" % train_mb_count)
+                        print("current epoch mean cost %f" % np.mean(train_costs))
                         print(" ")
                     else:
                         print(".", end="")
-                    valid_mb_count += 1
+                    train_mb_count += 1
             except StopIteration:
-                pass
-            print(" ")
-            valid_stop = time.time()
-            epoch_stop = time.time()
+                train_stop = time.time()
+                valid_costs = []
+                print(" ")
+                print("starting validation, epoch %i" % e)
+                print(" ")
+                valid_start = time.time()
+                try:
+                    while True:
+                        partial_valid_costs = _loop(valid_function, valid_itr)
+                        valid_costs.append(np.mean(partial_valid_costs))
+                        draw = random_state.rand()
+                        if draw < monitor_prob:
+                            print(" ")
+                            print("valid mb %i" % valid_mb_count)
+                            print("current validation mean cost %f" % np.mean(
+                                valid_costs))
+                            print(" ")
+                        else:
+                            print(".", end="")
+                        valid_mb_count += 1
+                except StopIteration:
+                    pass
+                print(" ")
+                valid_stop = time.time()
+                epoch_stop = time.time()
 
-            # Logging and tracking training statistics
-            epoch_time_delta = epoch_stop - epoch_start
-            epoch_time_total += epoch_time_delta
-            overall_epoch_deltas.append(epoch_time_delta)
-            overall_epoch_times.append(epoch_time_total)
+                # Logging and tracking training statistics
+                epoch_time_delta = epoch_stop - epoch_start
+                epoch_time_total += epoch_time_delta
+                overall_epoch_deltas.append(epoch_time_delta)
+                overall_epoch_times.append(epoch_time_total)
 
-            train_time_delta = train_stop - train_start
-            train_time_total += train_time_delta
-            overall_train_deltas.append(train_time_delta)
-            overall_train_times.append(train_time_total)
+                train_time_delta = train_stop - train_start
+                train_time_total += train_time_delta
+                overall_train_deltas.append(train_time_delta)
+                overall_train_times.append(train_time_total)
 
-            valid_time_delta = valid_stop - valid_start
-            valid_time_total += valid_time_delta
-            overall_valid_deltas.append(valid_time_delta)
-            overall_valid_times.append(valid_time_total)
+                valid_time_delta = valid_stop - valid_start
+                valid_time_total += valid_time_delta
+                overall_valid_deltas.append(valid_time_delta)
+                overall_valid_times.append(valid_time_total)
 
-            mean_epoch_train_cost = np.mean(train_costs)
-            # np.inf trick to avoid taking the min of length 0 list
-            old_min_train_cost = min(overall_train_costs + [np.inf])
-            if np.isnan(mean_epoch_train_cost):
-                print("previous train costs %s" % overall_train_costs[-5:])
-                print("NaN detected in train cost, epoch %i" % e)
-                break
-            overall_train_costs.append(mean_epoch_train_cost)
+                mean_epoch_train_cost = np.mean(train_costs)
+                # np.inf trick to avoid taking the min of length 0 list
+                old_min_train_cost = min(overall_train_costs + [np.inf])
+                if np.isnan(mean_epoch_train_cost):
+                    print("previous train costs %s" % overall_train_costs[-5:])
+                    print("NaN detected in train cost, epoch %i" % e)
+                    break
+                overall_train_costs.append(mean_epoch_train_cost)
 
-            mean_epoch_valid_cost = np.mean(valid_costs)
-            old_min_valid_cost = min(overall_valid_costs + [np.inf])
-            if np.isnan(mean_epoch_valid_cost):
-                print("previous valid costs %s" % overall_valid_costs[-5:])
-                print("NaN detected in valid cost, epoch %i" % e)
-                break
-            overall_valid_costs.append(mean_epoch_valid_cost)
+                mean_epoch_valid_cost = np.mean(valid_costs)
+                old_min_valid_cost = min(overall_valid_costs + [np.inf])
+                if np.isnan(mean_epoch_valid_cost):
+                    print("previous valid costs %s" % overall_valid_costs[-5:])
+                    print("NaN detected in valid cost, epoch %i" % e)
+                    break
+                overall_valid_costs.append(mean_epoch_valid_cost)
 
-            # Control part for exponential backoff
-            tcf = tcfi * tcf
-            if tcf > train_cost_fraction:
-                tcf = train_cost_fraction
-            overall_train_fractions.append(tcf)
+                if mean_epoch_train_cost < old_min_train_cost:
+                    overall_train_checkpoint.append(mean_epoch_train_cost)
+                else:
+                    overall_train_checkpoint.append(old_min_train_cost)
 
-            vcf = vcfi * vcf
-            if vcf > valid_cost_fraction:
-                vcf = valid_cost_fraction
-            overall_valid_fractions.append(vcf)
+                if mean_epoch_valid_cost < old_min_valid_cost:
+                    overall_valid_checkpoint.append(mean_epoch_valid_cost)
+                else:
+                    overall_valid_checkpoint.append(old_min_valid_cost)
 
-            tctb = old_min_train_cost
-            tctb += int(tctb <= 0) * (1 - tcf) * tctb
-            tctb -= int(tctb > 0) * (1 - tcf) * tctb
-            if np.isinf(old_min_train_cost):
-                # Edge case before first min
-                overall_train_to_beat.append(mean_epoch_train_cost)
-            else:
-                overall_train_to_beat.append(tctb)
+                checkpoint_dict["train_costs"] = overall_train_costs
+                checkpoint_dict["valid_costs"] = overall_valid_costs
+                # Auto tracking times
+                checkpoint_dict["epoch_deltas_auto"] = overall_epoch_deltas
+                checkpoint_dict["epoch_times_auto"] = overall_epoch_times
+                checkpoint_dict["train_deltas_auto"] = overall_train_deltas
+                checkpoint_dict["train_times_auto"] = overall_train_times
+                checkpoint_dict["valid_deltas_auto"] = overall_valid_deltas
+                checkpoint_dict["valid_times_auto"] = overall_valid_times
+                checkpoint_dict["checkpoint_deltas_auto"] = overall_checkpoint_deltas
+                checkpoint_dict["checkpoint_times_auto"] = overall_checkpoint_times
+                checkpoint_dict["joint_deltas_auto"] = overall_joint_deltas
+                checkpoint_dict["joint_times_auto"] = overall_joint_times
+                # Tracking if checkpoints are made
+                checkpoint_dict["train_checkpoint_auto"] = overall_train_checkpoint
+                checkpoint_dict["valid_checkpoint_auto"] = overall_valid_checkpoint
 
-            vctb = old_min_valid_cost
-            vctb += int(vctb <= 0) * (1 - vcf) * vctb
-            vctb -= int(vctb > 0) * (1 - vcf) * vctb
-            if np.isinf(old_min_valid_cost):
-                # Edge case before first min
-                overall_valid_to_beat.append(mean_epoch_valid_cost)
-            else:
-                overall_valid_to_beat.append(vctb)
-            # Set all checkpoints to 0, update if something happens
-            overall_valid_checkpoint.append(0.)
-            overall_train_checkpoint.append(0.)
-            overall_force_checkpoint.append(0.)
-            overall_joint_checkpoint.append(0.)
+                script = get_script_name()
+                print("script %s" % script)
+                print("epoch %i complete" % e)
+                print("epoch mean train cost %f" % mean_epoch_train_cost)
+                print("epoch mean valid cost %f" % mean_epoch_valid_cost)
+                print("overall train costs %s" % overall_train_costs[-5:])
+                print("overall valid costs %s" % overall_valid_costs[-5:])
 
-            checkpoint_dict["train_costs"] = overall_train_costs
-            checkpoint_dict["valid_costs"] = overall_valid_costs
-            # Auto tracking times
-            checkpoint_dict["epoch_deltas_auto"] = overall_epoch_deltas
-            checkpoint_dict["epoch_times_auto"] = overall_epoch_times
-            checkpoint_dict["train_deltas_auto"] = overall_train_deltas
-            checkpoint_dict["train_times_auto"] = overall_train_times
-            checkpoint_dict["valid_deltas_auto"] = overall_valid_deltas
-            checkpoint_dict["valid_times_auto"] = overall_valid_times
-            checkpoint_dict["checkpoint_deltas_auto"] = overall_checkpoint_deltas
-            checkpoint_dict["checkpoint_times_auto"] = overall_checkpoint_times
-            checkpoint_dict["joint_deltas_auto"] = overall_joint_deltas
-            checkpoint_dict["joint_times_auto"] = overall_joint_times
-            # Auto tracking fraction
-            checkpoint_dict["train_to_beat_auto"] = overall_train_to_beat
-            checkpoint_dict["valid_to_beat_auto"] = overall_valid_to_beat
-            checkpoint_dict["train_fractions_auto"] = overall_train_fractions
-            checkpoint_dict["valid_fractions_auto"] = overall_valid_fractions
-            # Tracking if checkpoints are made
-            checkpoint_dict["train_checkpoint_auto"] = overall_train_checkpoint
-            checkpoint_dict["valid_checkpoint_auto"] = overall_valid_checkpoint
-            checkpoint_dict["force_checkpoint_auto"] = overall_force_checkpoint
-            checkpoint_dict["joint_checkpoint_auto"] = overall_joint_checkpoint
+                results_dict = {k: v for k, v in checkpoint_dict.items()
+                                if k not in ignore_keys}
 
-            script = get_script_name()
-            print("script %s" % script)
-            print("epoch %i complete" % e)
-            print("epoch mean train cost %f" % mean_epoch_train_cost)
-            print("epoch mean valid cost %f" % mean_epoch_valid_cost)
-            print("overall train costs %s" % overall_train_costs[-5:])
-            print("overall valid costs %s" % overall_valid_costs[-5:])
+                # Checkpointing part
+                checkpoint_start = time.time()
+                if e < checkpoint_delay:
+                    print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
+                    print("Continuing without checkpoint")
+                elif mean_epoch_valid_cost < old_min_valid_cost:
+                    print("Checkpointing valid...")
+                    # Using dumps so relationship between keys in the pickle
+                    # is preserved
+                    best_valid_checkpoint_pickle = pickle.dumps(checkpoint_dict)
+                    best_valid_checkpoint_epoch = e
+                    if mean_epoch_train_cost < old_min_train_cost:
+                        best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
+                        best_train_checkpoint_epoch = e
+                    print("Valid checkpointing complete.")
+                elif mean_epoch_train_cost < old_min_train_cost:
+                    print("Checkpointing train...")
+                    best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
+                    best_train_checkpoint_epoch = e
+                    print("Train checkpointing complete.")
+                elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
+                    print("Checkpointing force...")
+                    checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
+                    weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
+                    results_save_path = "%s_model_results_%i.html" % (ident, e)
+                    tcw.send((checkpoint_save_path, checkpoint_dict))
+                    tww.send((weights_save_path, checkpoint_dict))
+                    thw.send((results_save_path, results_dict))
+                    print("Force checkpointing complete.")
 
-            results_dict = {k: v for k, v in checkpoint_dict.items()
-                            if k not in ignore_keys}
+                checkpoint_stop = time.time()
+                joint_stop = time.time()
 
-            # Checkpointing part
-            checkpoint_start = time.time()
-            if e < checkpoint_delay:
-                print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
-                print("Continuing without checkpoint")
-            elif mean_epoch_valid_cost < vctb:
-                print("Checkpointing valid...")
-                overall_valid_checkpoint[-1] = mean_epoch_valid_cost
-                overall_joint_checkpoint[-1] = mean_epoch_valid_cost
-                vcf = vcf ** 2
-                # If train is better update that too
-                if mean_epoch_train_cost < tctb:
-                    tcf = tcf ** 2
-                checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
-                weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
-                results_save_path = "%s_model_results_valid_%i.html" % (ident, e)
-                tcw.send((checkpoint_save_path, checkpoint_dict))
-                tww.send((weights_save_path, checkpoint_dict))
-                thw.send((results_save_path, results_dict))
-            elif mean_epoch_train_cost < tctb:
-                print("Checkpointing train...")
-                overall_train_checkpoint[-1] = mean_epoch_train_cost
-                overall_joint_checkpoint[-1] = mean_epoch_train_cost
-                tcf = tcf ** 2
-                checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
-                weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
-                results_save_path = "%s_model_results_train_%i.html" % (ident, e)
-                tcw.send((checkpoint_save_path, checkpoint_dict))
-                tww.send((weights_save_path, checkpoint_dict))
-                thw.send((results_save_path, results_dict))
-            elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
-                print("Checkpointing...")
-                overall_force_checkpoint[-1] = mean_epoch_train_cost
-                overall_joint_checkpoint[-1] = mean_epoch_train_cost
-                checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
-                weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
-                results_save_path = "%s_model_results_%i.html" % (ident, e)
-                tcw.send((checkpoint_save_path, checkpoint_dict))
-                tww.send((weights_save_path, checkpoint_dict))
+                # Always save latest
+                results_save_path = "%s_most_recent_results.html" % ident
                 thw.send((results_save_path, results_dict))
 
-            checkpoint_stop = time.time()
-            joint_stop = time.time()
+                # Will show up next go around
+                checkpoint_time_delta = checkpoint_stop - checkpoint_start
+                checkpoint_time_total += checkpoint_time_delta
+                overall_checkpoint_deltas.append(checkpoint_time_delta)
+                overall_checkpoint_times.append(checkpoint_time_total)
 
-            # Always save latest
-            results_save_path = "%s_most_recent_results.html" % ident
-            thw.send((results_save_path, results_dict))
+                joint_time_delta = joint_stop - joint_start
+                joint_time_total += joint_time_delta
+                overall_joint_deltas.append(joint_time_delta)
+                overall_joint_times.append(joint_time_total)
+    except KeyboardInterrupt:
+        print("Training loop interrupted by user! Saving current best results.")
 
-            # Will show up next go around
-            checkpoint_time_delta = checkpoint_stop - checkpoint_start
-            checkpoint_time_total += checkpoint_time_delta
-            overall_checkpoint_deltas.append(checkpoint_time_delta)
-            overall_checkpoint_times.append(checkpoint_time_total)
+    # Finalize saving best train and valid
+    best_valid_checkpoint_dict = pickle.loads(best_valid_checkpoint_pickle)
+    best_valid_results_dict = {k: v for k, v in best_valid_checkpoint_dict.items()
+                               if k not in ignore_keys}
+    ee = best_valid_checkpoint_epoch
+    checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, ee)
+    weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, ee)
+    results_save_path = "%s_model_results_valid_%i.html" % (ident, ee)
+    tcw.send((checkpoint_save_path, best_valid_checkpoint_dict))
+    tww.send((weights_save_path, best_valid_checkpoint_dict))
+    thw.send((results_save_path, best_valid_results_dict))
 
-            joint_time_delta = joint_stop - joint_start
-            joint_time_total += joint_time_delta
-            overall_joint_deltas.append(joint_time_delta)
-            overall_joint_times.append(joint_time_total)
+    best_train_checkpoint_dict = pickle.loads(best_train_checkpoint_pickle)
+    best_train_results_dict = {k: v for k, v in best_train_checkpoint_dict.items()
+                               if k not in ignore_keys}
+    ee = best_train_checkpoint_epoch
+    checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, ee)
+    weights_save_path = "%s_model_weights_train_%i.npz" % (ident, ee)
+    results_save_path = "%s_model_results_train_%i.html" % (ident, ee)
+    tcw.send((checkpoint_save_path, best_train_checkpoint_dict))
+    tww.send((weights_save_path, best_train_checkpoint_dict))
+    thw.send((results_save_path, best_train_results_dict))
     print("run_loop finished, closing write threads (this may take a while!)")
     tcw.close()
     tww.close()
