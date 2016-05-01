@@ -3871,8 +3871,6 @@ def run_loop(loop_function, train_function, train_itr,
         joint_time_total = overall_joint_times[-1]
 
         start_epoch = len(overall_train_costs)
-        train_cost_to_beat = overall_train_to_beat[-1]
-        valid_cost_to_beat = overall_valid_to_beat[-1]
 
         tcf = overall_train_fractions[-1]
         tcfi = train_cost_fraction_increment
@@ -4014,16 +4012,16 @@ def run_loop(loop_function, train_function, train_itr,
             tctb = old_min_train_cost
             tctb += int(tctb <= 0) * (1 - tcf) * tctb
             tctb -= int(tctb > 0) * (1 - tcf) * tctb
-            if np.isinf(train_cost_to_beat):
+            if np.isinf(old_min_train_cost):
                 # Edge case before first min
                 overall_train_to_beat.append(mean_epoch_train_cost)
             else:
                 overall_train_to_beat.append(tctb)
 
-            vctb = old_min_train_cost
+            vctb = old_min_valid_cost
             vctb += int(vctb <= 0) * (1 - vcf) * vctb
             vctb -= int(vctb > 0) * (1 - vcf) * vctb
-            if np.isinf(valid_cost_to_beat):
+            if np.isinf(old_min_valid_cost):
                 # Edge case before first min
                 overall_valid_to_beat.append(mean_epoch_valid_cost)
             else:
@@ -4078,11 +4076,9 @@ def run_loop(loop_function, train_function, train_itr,
                 print("Checkpointing valid...")
                 overall_valid_checkpoint[-1] = mean_epoch_valid_cost
                 overall_joint_checkpoint[-1] = mean_epoch_valid_cost
-                valid_cost_to_beat = mean_epoch_valid_cost
                 vcf = vcf ** 2
                 # If train is better update that too
                 if mean_epoch_train_cost < tctb:
-                    train_cost_to_beat = mean_epoch_train_cost
                     tcf = tcf ** 2
                 checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
@@ -4094,7 +4090,6 @@ def run_loop(loop_function, train_function, train_itr,
                 print("Checkpointing train...")
                 overall_train_checkpoint[-1] = mean_epoch_train_cost
                 overall_joint_checkpoint[-1] = mean_epoch_train_cost
-                train_cost_to_beat = mean_epoch_train_cost
                 tcf = tcf ** 2
                 checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
