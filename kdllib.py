@@ -10,6 +10,7 @@ from scipy.io import wavfile
 import scipy.signal as sg
 import inspect
 from collections import Iterable, defaultdict
+import socket
 import wave
 import tarfile
 import zipfile
@@ -20,7 +21,10 @@ import copy
 from collections import Counter
 import time
 import sys
-import pickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 import itertools
 import time
 try:
@@ -31,11 +35,14 @@ import threading
 import theano
 import theano.tensor as tensor
 from theano.tensor.nnet.abstract_conv import conv2d_grad_wrt_inputs
+# Doesn't support binomial with n > 1??
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 try:
     import urllib.request as urllib  # for backwards compatibility
 except ImportError:
     import urllib2 as urllib
+
+sys.setrecursionlimit(40000)
 
 """
 begin decorators
@@ -76,6 +83,13 @@ def soundsc(X, copy=True):
     X = .9 * X
     X = 2 * X - 1
     return X.astype('float32')
+
+
+def get_script_name():
+    script_path = os.path.abspath(sys.argv[0])
+    # Assume it ends with .py ...
+    script_name = script_path.split(os.sep)[-1]
+    return script_name
 
 
 def get_resource_dir(name, resource_dir=None, folder=None, create_dir=True):
@@ -308,6 +322,26 @@ class Blizzard_dataset(object):
                 group = self.grouped_elements.next()
                 self.queue.put(group)
         return wav_group, text_group
+
+
+def fetch_sample_audio_chords(n_samples=None):
+    url = "https://dl.dropboxusercontent.com/u/15378192/piano_chords.tar.gz"
+    partial_path = get_resource_dir("chords")
+    full_path = os.path.join(partial_path, "piano_chords.tar.gz")
+    if not os.path.exists(full_path):
+        download(url, full_path)
+
+    tf = tarfile.open(full_path)
+    wav_names = [fname for fname in tf.getnames()
+                 if ".wav" in fname.split(os.sep)[-1]]
+    chords = []
+    print("Loading audio files...")
+    for wav_name in wav_names[:n_samples]:
+        f = tf.extractfile(wav_name)
+        fs, d = wavfile.read(f)
+        d = d.astype('float32') / (2 ** 15)
+        chords.append(d)
+    return fs, chords, wav_names
 
 
 def fetch_sample_speech_fruit(n_samples=None):
@@ -970,7 +1004,9 @@ def iterate_invert_spectrogram(X_s, fftsize, step, n_iter=10, verbose=False,
                                      set_zero_phase=False)
         est = stft(X_t, fftsize=fftsize, step=step, compute_onesided=False)
         phase = est / np.maximum(reg, np.abs(est))
-        X_best = X_s * phase[:len(X_s)]
+        phase = phase[:len(X_s)]
+        X_s = X_s[:len(phase)]
+        X_best = X_s * phase
     X_t = invert_spectrogram(X_best, step, calculate_offset=True,
                              set_zero_phase=False)
     return np.real(X_t)
@@ -1865,7 +1901,7 @@ def fetch_fruitspeech_spectrogram():
     for n, cl in enumerate(classes):
         y.append(tokenize_ind(cl, char2code))
 
-    X, _re = apply_spectrogram_preproc(d)
+    X, _re = apply_binned_spectrogram_preproc(d)
 
     """
     for n, Xi in enumerate(X[::8]):
@@ -2975,6 +3011,9 @@ class GRU(object):
     def get_params(self):
         return self.Wur, self.U
 
+    def get_biases(self):
+        raise AttributeError("GRU cell has no biases!")
+
     def step(self, inp, gate_inp, prev_state):
         dim = self.shape[1]
         gates = tensor.nnet.sigmoid(tensor.dot(prev_state, self.Wur) + gate_inp)
@@ -2997,6 +3036,9 @@ class GRUFork(object):
 
     def get_params(self):
         return self.W, self.b
+
+    def get_biases(self):
+        return [self.b]
 
     def proj(self, inp):
         dim = self.shape[1]
@@ -3033,22 +3075,15 @@ def tanh(x):
     return tensor.tanh(x)
 
 
+def sigmoid(x):
+    return tensor.nnet.sigmoid(x)
+
+
 def theano_one_hot(t, n_classes=None):
     if n_classes is None:
         n_classes = tensor.max(t) + 1
     ranges = tensor.shape_padleft(tensor.arange(n_classes), t.ndim)
     return tensor.eq(ranges, tensor.shape_padright(t, 1))
-
-
-def sample_softmax(coeff, theano_rng, epsilon=1E-5, debug=False):
-    if coeff.ndim > 2:
-        raise ValueError("Unsupported dim")
-    if debug:
-        idx = coeff.argmax(axis=1)
-    else:
-        idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
-                            axis=1)
-    return tensor.cast(idx, theano.config.floatX)
 
 
 def categorical_crossentropy(predicted_values, true_values, eps=0.):
@@ -3091,6 +3126,26 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
         s = tensor.arange(pred.shape[0])
         correct = -tensor.log(pred)[s, ind]
         return correct.reshape(shp[:-1])
+
+
+def sample_binomial(coeff, n_bins, theano_rng, debug=False):
+    # ? Normal approximation?
+    if debug:
+        idx = coeff * n_bins
+    else:
+        idx = theano_rng.binomial(n=n_bins, p=coeff, dtype=coeff.dtype)
+    return tensor.cast(idx, theano.config.floatX)
+
+
+def sample_softmax(coeff, theano_rng, epsilon=1E-5, debug=False):
+    if coeff.ndim > 2:
+        raise ValueError("Unsupported dim")
+    if debug:
+        idx = coeff.argmax(axis=1)
+    else:
+        idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
+                            axis=1)
+    return tensor.cast(idx, theano.config.floatX)
 
 
 def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5,
@@ -3516,10 +3571,9 @@ def set_shared_variables_in_function(func, list_of_values):
     [s.set_value(v) for s, v in safe_zip(shared_variables, list_of_values)]
 
 
-def save_weights(save_weights_path, items_dict):
+def save_weights(save_path, items_dict, use_resource_dir=True):
     print("Not saving weights due to copy issues in npz")
     return
-    print("Saving weights to %s" % save_weights_path)
     weights_dict = {}
     # k is the function name, v is a theano function
     for k, v in items_dict.items():
@@ -3528,14 +3582,21 @@ def save_weights(save_weights_path, items_dict):
             w = get_values_from_function(v)
             for n, w_v in enumerate(w):
                 weights_dict[k + "_%i" % n] = w_v
+    if use_resource_dir:
+        # Assume it ends with .py ...
+        script_name = get_script_name()[:-3]
+        save_path = os.path.join(get_resource_dir(script_name), save_path)
+    print("Saving weights to %s" % save_weights_path)
     if len(weights_dict.keys()) > 0:
-        np.savez(save_weights_path, **weights_dict)
+        np.savez(save_path, **weights_dict)
     else:
         print("Possible BUG: no theano functions found in items_dict, "
               "unable to save weights!")
+    print("Weight saving complete %s" % save_path)
+
 
 @coroutine
-def threaded_weights_writer(maxsize=10):
+def threaded_weights_writer(maxsize=25):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
@@ -3559,17 +3620,20 @@ def threaded_weights_writer(maxsize=10):
         messages.put((1, GeneratorExit))
 
 
-def save_checkpoint(save_path, pickle_item):
-    print("Saving checkpoint to %s" % save_path)
-    old_recursion_limit = sys.getrecursionlimit()
+def save_checkpoint(save_path, pickle_item, use_resource_dir=True):
+    if use_resource_dir:
+        # Assume it ends with .py ...
+        script_name = get_script_name()[:-3]
+        save_path = os.path.join(get_resource_dir(script_name), save_path)
     sys.setrecursionlimit(40000)
+    print("Saving checkpoint to %s" % save_path)
     with open(save_path, mode="wb") as f:
         pickle.dump(pickle_item, f, protocol=-1)
-    sys.setrecursionlimit(old_recursion_limit)
+    print("Checkpoint saving complete %s" % save_path)
 
 
 @coroutine
-def threaded_checkpoint_writer(maxsize=10):
+def threaded_checkpoint_writer(maxsize=25):
     """
     Expects to be sent a tuple of (save_path, checkpoint_dict)
     """
@@ -3659,17 +3723,26 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
     return all_filled_lines
 
 
-def save_results_as_html(save_path, results_dict, default_no_show="_auto"):
+def save_results_as_html(save_path, results_dict, use_resource_dir=True,
+                         default_no_show="_auto"):
     show_keys = [k for k in results_dict.keys()
                  if default_no_show not in k]
     as_html = filled_js_template_from_results_dict(
         results_dict, default_show=show_keys)
+    if use_resource_dir:
+        # Assume it ends with .py ...
+        script_name = get_script_name()[:-3]
+        save_path = os.path.join(get_resource_dir(script_name), save_path)
+    hostname = socket.gethostname()
+    print("Running on host %s" % hostname)
+    print("Saving HTML results %s" % save_path)
     with open(save_path, "w") as f:
         f.writelines(as_html)
+    print("Completed HTML results saving %s" % save_path)
 
 
 @coroutine
-def threaded_html_writer(maxsize=10):
+def threaded_html_writer(maxsize=25):
     """
     Expects to be sent a tuple of (save_path, results_dict)
     """
@@ -3682,7 +3755,6 @@ def threaded_html_writer(maxsize=10):
             else:
                 save_path, results_dict = item
                 save_results_as_html(save_path, results_dict)
-
     threading.Thread(target=run_thread).start()
     try:
         n = 0
@@ -3727,7 +3799,7 @@ def run_loop(loop_function, train_function, train_itr,
              checkpoint_delay=10, checkpoint_every_n=100,
              monitor_frequency=100, train_cost_fraction=.8,
              train_cost_fraction_increment=1.01,
-             valid_cost_fraction=0.95, valid_cost_fraction_increment=1.02):
+             valid_cost_fraction=0.95, valid_cost_fraction_increment=1.01):
     """
     loop function should return a list of costs
     """
@@ -3763,6 +3835,10 @@ def run_loop(loop_function, train_function, train_itr,
         overall_valid_to_beat = checkpoint_dict["valid_to_beat_auto"]
         overall_train_fractions = checkpoint_dict["train_fractions_auto"]
         overall_valid_fractions = checkpoint_dict["valid_fractions_auto"]
+        overall_train_checkpoint = checkpoint_dict["train_checkpoint_auto"]
+        overall_valid_checkpoint = checkpoint_dict["valid_checkpoint_auto"]
+        overall_force_checkpoint = checkpoint_dict["force_checkpoint_auto"]
+        overall_joint_checkpoint = checkpoint_dict["joint_checkpoint_auto"]
         keys_checked = ["train_costs",
                         "valid_costs",
                         "epoch_deltas_auto",
@@ -3778,7 +3854,11 @@ def run_loop(loop_function, train_function, train_itr,
                         "train_to_beat_auto",
                         "valid_to_beat_auto",
                         "train_fractions_auto",
-                        "valid_fractions_auto"]
+                        "valid_fractions_auto",
+                        "train_checkpoint_auto",
+                        "valid_checkpoint_auto",
+                        "force_checkpoint_auto",
+                        "joint_checkpoint_auto"]
         not_handled = [k for k in checkpoint_dict.keys()
                        if k not in keys_checked and k not in ignore_keys]
         if len(not_handled) > 0:
@@ -3805,6 +3885,10 @@ def run_loop(loop_function, train_function, train_itr,
         overall_valid_to_beat = []
         overall_train_fractions = []
         overall_valid_fractions = []
+        overall_train_checkpoint = []
+        overall_valid_checkpoint = []
+        overall_force_checkpoint = []
+        overall_joint_checkpoint = []
 
         epoch_time_total = 0
         train_time_total = 0
@@ -3901,7 +3985,7 @@ def run_loop(loop_function, train_function, train_itr,
 
             mean_epoch_train_cost = np.mean(train_costs)
             # np.inf trick to avoid taking the min of length 0 list
-            new_min_train_cost = min(overall_train_costs + [np.inf])
+            old_min_train_cost = min(overall_train_costs + [np.inf])
             if np.isnan(mean_epoch_train_cost):
                 print("previous train costs %s" % overall_train_costs[-5:])
                 print("NaN detected in train cost, epoch %i" % e)
@@ -3909,7 +3993,7 @@ def run_loop(loop_function, train_function, train_itr,
             overall_train_costs.append(mean_epoch_train_cost)
 
             mean_epoch_valid_cost = np.mean(valid_costs)
-            new_min_valid_cost = min(overall_valid_costs + [np.inf])
+            old_min_valid_cost = min(overall_valid_costs + [np.inf])
             if np.isnan(mean_epoch_valid_cost):
                 print("previous valid costs %s" % overall_valid_costs[-5:])
                 print("NaN detected in valid cost, epoch %i" % e)
@@ -3918,33 +4002,37 @@ def run_loop(loop_function, train_function, train_itr,
 
             # Control part for exponential backoff
             tcf = tcfi * tcf
-            vcf = vcfi * vcf
-
-            if train_cost_to_beat < 0 and tcf < 1:
-                # if cost is < 0 logic has to change
-                tcf = 1 + (1 - tcf)
-            elif tcf > train_cost_fraction:
+            if tcf > train_cost_fraction:
                 tcf = train_cost_fraction
             overall_train_fractions.append(tcf)
 
-            if valid_cost_to_beat < 0 and vcf < 1:
-                # if cost is < 0 logic has to change
-                vcf = 1 + (1 - vcf)
-            elif vcf > valid_cost_fraction:
+            vcf = vcfi * vcf
+            if vcf > valid_cost_fraction:
                 vcf = valid_cost_fraction
             overall_valid_fractions.append(vcf)
 
+            tctb = old_min_train_cost
+            tctb += int(tctb <= 0) * (1 - tcf) * tctb
+            tctb -= int(tctb > 0) * (1 - tcf) * tctb
             if np.isinf(train_cost_to_beat):
                 # Edge case before first min
                 overall_train_to_beat.append(mean_epoch_train_cost)
             else:
-                overall_train_to_beat.append(tcf * train_cost_to_beat)
+                overall_train_to_beat.append(tctb)
 
+            vctb = old_min_train_cost
+            vctb += int(vctb <= 0) * (1 - vcf) * vctb
+            vctb -= int(vctb > 0) * (1 - vcf) * vctb
             if np.isinf(valid_cost_to_beat):
                 # Edge case before first min
                 overall_valid_to_beat.append(mean_epoch_valid_cost)
             else:
-                overall_valid_to_beat.append(vcf * valid_cost_to_beat)
+                overall_valid_to_beat.append(vctb)
+            # Set all checkpoints to 0, update if something happens
+            overall_valid_checkpoint.append(0.)
+            overall_train_checkpoint.append(0.)
+            overall_force_checkpoint.append(0.)
+            overall_joint_checkpoint.append(0.)
 
             checkpoint_dict["train_costs"] = overall_train_costs
             checkpoint_dict["valid_costs"] = overall_valid_costs
@@ -3964,8 +4052,13 @@ def run_loop(loop_function, train_function, train_itr,
             checkpoint_dict["valid_to_beat_auto"] = overall_valid_to_beat
             checkpoint_dict["train_fractions_auto"] = overall_train_fractions
             checkpoint_dict["valid_fractions_auto"] = overall_valid_fractions
+            # Tracking if checkpoints are made
+            checkpoint_dict["train_checkpoint_auto"] = overall_train_checkpoint
+            checkpoint_dict["valid_checkpoint_auto"] = overall_valid_checkpoint
+            checkpoint_dict["force_checkpoint_auto"] = overall_force_checkpoint
+            checkpoint_dict["joint_checkpoint_auto"] = overall_joint_checkpoint
 
-            script = os.path.abspath(inspect.stack()[0][1])
+            script = get_script_name()
             print("script %s" % script)
             print("epoch %i complete" % e)
             print("epoch mean train cost %f" % mean_epoch_train_cost)
@@ -3981,24 +4074,28 @@ def run_loop(loop_function, train_function, train_itr,
             if e < checkpoint_delay:
                 print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
                 print("Continuing without checkpoint")
-            elif mean_epoch_valid_cost < vcf * valid_cost_to_beat:
+            elif mean_epoch_valid_cost < vctb:
                 print("Checkpointing valid...")
-                valid_cost_to_beat = new_min_valid_cost
+                overall_valid_checkpoint[-1] = mean_epoch_valid_cost
+                overall_joint_checkpoint[-1] = mean_epoch_valid_cost
+                valid_cost_to_beat = mean_epoch_valid_cost
                 vcf = vcf ** 2
                 # If train is better update that too
-                if new_min_train_cost < train_cost_to_beat:
+                if mean_epoch_train_cost < tctb:
+                    train_cost_to_beat = mean_epoch_train_cost
                     tcf = tcf ** 2
-                    train_cost_to_beat = new_min_train_cost
                 checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_valid_%i.html" % (ident, e)
                 tcw.send((checkpoint_save_path, checkpoint_dict))
                 tww.send((weights_save_path, checkpoint_dict))
                 thw.send((results_save_path, results_dict))
-            elif mean_epoch_train_cost < tcf * train_cost_to_beat:
+            elif mean_epoch_train_cost < tctb:
                 print("Checkpointing train...")
+                overall_train_checkpoint[-1] = mean_epoch_train_cost
+                overall_joint_checkpoint[-1] = mean_epoch_train_cost
+                train_cost_to_beat = mean_epoch_train_cost
                 tcf = tcf ** 2
-                train_cost_to_beat = new_min_train_cost
                 checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_train_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_train_%i.html" % (ident, e)
@@ -4007,6 +4104,8 @@ def run_loop(loop_function, train_function, train_itr,
                 thw.send((results_save_path, results_dict))
             elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
                 print("Checkpointing...")
+                overall_force_checkpoint[-1] = mean_epoch_train_cost
+                overall_joint_checkpoint[-1] = mean_epoch_train_cost
                 checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                 weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                 results_save_path = "%s_model_results_%i.html" % (ident, e)
