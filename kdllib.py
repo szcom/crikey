@@ -1420,6 +1420,7 @@ class base_iterator(object):
         if axis not in [0, 1]:
             raise ValueError("Unknown sample_axis setting %i" % axis)
         self.one_hot_class_size = one_hot_class_size
+        self.random_state = np.random.RandomState(2017)
         len0 = len(list_of_containers[0])
         assert all([len(ci) == len0 for ci in list_of_containers])
         if one_hot_class_size is not None:
@@ -1428,9 +1429,15 @@ class base_iterator(object):
     def reset(self):
         self.slice_start_ = self.start_index
         if self.randomize:
+            start_ind = self.start_index
             stop_ind = min(len(self.list_of_containers[0]), self.stop_index)
-            start_ind = max(0, self.start_index)
-            inds = np.arange(start_ind, stop_ind)
+            inds = np.arange(start_ind, stop_ind).astype("int32")
+            # If start index is > 0 then pull some mad hackery to only shuffle
+            # the end part - eg. validation set.
+            self.random_state.shuffle(inds)
+            if start_ind > 0:
+                orig_inds = np.arange(0, start_ind).astype("int32")
+                inds = np.concatenate((orig_inds, inds))
             new_list_of_containers = []
             for ci in self.list_of_containers:
                 nci = [ci[i] for i in inds]
@@ -2872,6 +2879,52 @@ def np_identity(shape, random_state, scale=0.98):
     return (scale * res).astype(theano.config.floatX)
 
 
+def concatenate(tensor_list, axis=0):
+    """
+    Alternative implementation of `theano.tensor.concatenate`.
+    This function does exactly the same thing, but contrary to Theano's own
+    implementation, the gradient is implemented on the GPU.
+    Backpropagating through `theano.tensor.concatenate` yields slowdowns
+    because the inverse operation (splitting) needs to be done on the CPU.
+    This implementation does not have that problem.
+    :usage:
+        >>> x, y = theano.tensor.matrices('x', 'y')
+        >>> c = concatenate([x, y], axis=1)
+    :parameters:
+        - tensor_list : list
+            list of Theano tensor expressions that should be concatenated.
+        - axis : int
+            the tensors will be joined along this axis.
+    :returns:
+        - out : tensor
+            the concatenated tensor expression.
+    """
+    if axis < 0:
+        axis = tensor_list[0].ndim + axis
+    concat_size = sum(tt.shape[axis] for tt in tensor_list)
+
+    output_shape = ()
+    for k in range(axis):
+        output_shape += (tensor_list[0].shape[k],)
+    output_shape += (concat_size,)
+    for k in range(axis + 1, tensor_list[0].ndim):
+        output_shape += (tensor_list[0].shape[k],)
+
+    out = tensor.zeros(output_shape)
+    offset = 0
+    for tt in tensor_list:
+        indices = ()
+        for k in range(axis):
+            indices += (slice(None),)
+        indices += (slice(offset, offset + tt.shape[axis]),)
+        for k in range(axis + 1, tensor_list[0].ndim):
+            indices += (slice(None),)
+
+        out = tensor.set_subtensor(out[indices], tt)
+        offset += tt.shape[axis]
+    return out
+
+
 def as_shared(arr, name=None):
     """ Quick wrapper for theano.shared """
     if type(arr) in [float, int]:
@@ -3130,10 +3183,20 @@ def categorical_crossentropy(predicted_values, true_values, eps=0.):
 
 def sample_binomial(coeff, n_bins, theano_rng, debug=False):
     # ? Normal approximation?
+    if coeff.ndim > 2:
+        raise ValueError("Unsupported dim")
     if debug:
         idx = coeff * n_bins
     else:
-        idx = theano_rng.binomial(n=n_bins, p=coeff, dtype=coeff.dtype)
+        shp = coeff.shape
+        inc = tensor.ones((shp[0], shp[1], n_bins))
+        expanded_coeff = coeff.dimshuffle(0, 1, 'x')
+        expanded_coeff = expanded_coeff * inc
+        # n > 1 not supported?
+        # idx = theano_rng.binomial(n=n_bins, p=coeff, dtype=coeff.dtype)
+        idx = theano_rng.binomial(n=1, p=expanded_coeff, dtype=coeff.dtype,
+                                  size=expanded_coeff.shape)
+        idx = idx.sum(axis=-1)
     return tensor.cast(idx, theano.config.floatX)
 
 
@@ -3572,7 +3635,7 @@ def set_shared_variables_in_function(func, list_of_values):
 
 
 def save_weights(save_path, items_dict, use_resource_dir=True):
-    print("Not saving weights due to copy issues in npz")
+    print("not saving weights due to copy issues in npz")
     return
     weights_dict = {}
     # k is the function name, v is a theano function
@@ -3586,13 +3649,13 @@ def save_weights(save_path, items_dict, use_resource_dir=True):
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    print("Saving weights to %s" % save_weights_path)
+    print("saving weights to %s" % save_weights_path)
     if len(weights_dict.keys()) > 0:
         np.savez(save_path, **weights_dict)
     else:
         print("Possible BUG: no theano functions found in items_dict, "
               "unable to save weights!")
-    print("Weight saving complete %s" % save_path)
+    print("weight saving complete %s" % save_path)
 
 
 @coroutine
@@ -3626,10 +3689,10 @@ def save_checkpoint(save_path, pickle_item, use_resource_dir=True):
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
     sys.setrecursionlimit(40000)
-    print("Saving checkpoint to %s" % save_path)
+    print("saving checkpoint to %s" % save_path)
     with open(save_path, mode="wb") as f:
         pickle.dump(pickle_item, f, protocol=-1)
-    print("Checkpoint saving complete %s" % save_path)
+    print("checkpoint saving complete %s" % save_path)
 
 
 @coroutine
@@ -3658,7 +3721,7 @@ def threaded_checkpoint_writer(maxsize=25):
 
 
 def load_checkpoint(saved_checkpoint_path):
-    print("Loading checkpoint from %s" % saved_checkpoint_path)
+    print("loading checkpoint from %s" % saved_checkpoint_path)
     old_recursion_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(40000)
     with open(saved_checkpoint_path, mode="rb") as f:
@@ -3733,12 +3796,10 @@ def save_results_as_html(save_path, results_dict, use_resource_dir=True,
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    hostname = socket.gethostname()
-    print("Running on host %s" % hostname)
-    print("Saving HTML results %s" % save_path)
+    print("saving HTML results %s" % save_path)
     with open(save_path, "w") as f:
         f.writelines(as_html)
-    print("Completed HTML results saving %s" % save_path)
+    print("completed HTML results saving %s" % save_path)
 
 
 @coroutine
@@ -3797,9 +3858,7 @@ def implot(arr, title="", cmap="gray", save_name=None):
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
              checkpoint_delay=10, checkpoint_every_n=100,
-             monitor_frequency=100, train_cost_fraction=.8,
-             train_cost_fraction_increment=1.01,
-             valid_cost_fraction=0.95, valid_cost_fraction_increment=1.01):
+             monitor_frequency=100, skip_minimums=False):
     """
     loop function should return a list of costs
     """
@@ -4001,23 +4060,23 @@ def run_loop(loop_function, train_function, train_itr,
                 checkpoint_dict["valid_checkpoint_auto"] = overall_valid_checkpoint
 
                 script = get_script_name()
-                print("script %s" % script)
+                hostname = socket.gethostname()
+                print("host %s, script %s" % (hostname, script))
                 print("epoch %i complete" % e)
                 print("epoch mean train cost %f" % mean_epoch_train_cost)
                 print("epoch mean valid cost %f" % mean_epoch_valid_cost)
-                print("overall train costs %s" % overall_train_costs[-5:])
-                print("overall valid costs %s" % overall_valid_costs[-5:])
+                print("previous train costs %s" % overall_train_costs[-5:])
+                print("previous valid costs %s" % overall_valid_costs[-5:])
 
                 results_dict = {k: v for k, v in checkpoint_dict.items()
                                 if k not in ignore_keys}
 
                 # Checkpointing part
                 checkpoint_start = time.time()
-                if e < checkpoint_delay:
-                    print("Epoch %i less than checkpoint_delay setting %i" % (e, checkpoint_delay))
-                    print("Continuing without checkpoint")
+                if e < checkpoint_delay or skip_minimums:
+                    pass
                 elif mean_epoch_valid_cost < old_min_valid_cost:
-                    print("Checkpointing valid...")
+                    print("checkpointing valid...")
                     # Using dumps so relationship between keys in the pickle
                     # is preserved
                     best_valid_checkpoint_pickle = pickle.dumps(checkpoint_dict)
@@ -4025,21 +4084,30 @@ def run_loop(loop_function, train_function, train_itr,
                     if mean_epoch_train_cost < old_min_train_cost:
                         best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                         best_train_checkpoint_epoch = e
-                    print("Valid checkpointing complete.")
+                    print("valid checkpointing complete.")
                 elif mean_epoch_train_cost < old_min_train_cost:
-                    print("Checkpointing train...")
+                    print("checkpointing train...")
                     best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                     best_train_checkpoint_epoch = e
-                    print("Train checkpointing complete.")
+                    print("train checkpointing complete.")
+
+                if e < checkpoint_delay:
+                    pass
+                    # Don't skip force checkpoints after default delay
+                    # Printing already happens above
                 elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
-                    print("Checkpointing force...")
+                    print("checkpointing force...")
                     checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                     weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                     results_save_path = "%s_model_results_%i.html" % (ident, e)
-                    tcw.send((checkpoint_save_path, checkpoint_dict))
-                    tww.send((weights_save_path, checkpoint_dict))
+                    # Use pickle to preserve relationships between keys
+                    # while still copying buffers
+                    copy_pickle = pickle.dumps(checkpoint_dict)
+                    copy_dict = pickle.loads(copy_pickle)
+                    tcw.send((checkpoint_save_path, copy_dict))
+                    tww.send((weights_save_path, copy_dict))
                     thw.send((results_save_path, results_dict))
-                    print("Force checkpointing complete.")
+                    print("force checkpointing complete.")
 
                 checkpoint_stop = time.time()
                 joint_stop = time.time()
@@ -4061,28 +4129,29 @@ def run_loop(loop_function, train_function, train_itr,
     except KeyboardInterrupt:
         print("Training loop interrupted by user! Saving current best results.")
 
-    # Finalize saving best train and valid
-    best_valid_checkpoint_dict = pickle.loads(best_valid_checkpoint_pickle)
-    best_valid_results_dict = {k: v for k, v in best_valid_checkpoint_dict.items()
-                               if k not in ignore_keys}
-    ee = best_valid_checkpoint_epoch
-    checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, ee)
-    weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, ee)
-    results_save_path = "%s_model_results_valid_%i.html" % (ident, ee)
-    tcw.send((checkpoint_save_path, best_valid_checkpoint_dict))
-    tww.send((weights_save_path, best_valid_checkpoint_dict))
-    thw.send((results_save_path, best_valid_results_dict))
+    if not skip_minimums:
+        # Finalize saving best train and valid
+        best_valid_checkpoint_dict = pickle.loads(best_valid_checkpoint_pickle)
+        best_valid_results_dict = {k: v for k, v in best_valid_checkpoint_dict.items()
+                                   if k not in ignore_keys}
+        ee = best_valid_checkpoint_epoch
+        checkpoint_save_path = "%s_model_checkpoint_valid_%i.pkl" % (ident, ee)
+        weights_save_path = "%s_model_weights_valid_%i.npz" % (ident, ee)
+        results_save_path = "%s_model_results_valid_%i.html" % (ident, ee)
+        tcw.send((checkpoint_save_path, best_valid_checkpoint_dict))
+        tww.send((weights_save_path, best_valid_checkpoint_dict))
+        thw.send((results_save_path, best_valid_results_dict))
 
-    best_train_checkpoint_dict = pickle.loads(best_train_checkpoint_pickle)
-    best_train_results_dict = {k: v for k, v in best_train_checkpoint_dict.items()
-                               if k not in ignore_keys}
-    ee = best_train_checkpoint_epoch
-    checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, ee)
-    weights_save_path = "%s_model_weights_train_%i.npz" % (ident, ee)
-    results_save_path = "%s_model_results_train_%i.html" % (ident, ee)
-    tcw.send((checkpoint_save_path, best_train_checkpoint_dict))
-    tww.send((weights_save_path, best_train_checkpoint_dict))
-    thw.send((results_save_path, best_train_results_dict))
+        best_train_checkpoint_dict = pickle.loads(best_train_checkpoint_pickle)
+        best_train_results_dict = {k: v for k, v in best_train_checkpoint_dict.items()
+                                   if k not in ignore_keys}
+        ee = best_train_checkpoint_epoch
+        checkpoint_save_path = "%s_model_checkpoint_train_%i.pkl" % (ident, ee)
+        weights_save_path = "%s_model_weights_train_%i.npz" % (ident, ee)
+        results_save_path = "%s_model_results_train_%i.html" % (ident, ee)
+        tcw.send((checkpoint_save_path, best_train_checkpoint_dict))
+        tww.send((weights_save_path, best_train_checkpoint_dict))
+        thw.send((results_save_path, best_train_results_dict))
     print("run_loop finished, closing write threads (this may take a while!)")
     tcw.close()
     tww.close()

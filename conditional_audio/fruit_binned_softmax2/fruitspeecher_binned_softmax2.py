@@ -5,7 +5,7 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from scipy.io import wavfile
 import os
 import sys
-from kdllib import load_checkpoint, theano_one_hot
+from kdllib import load_checkpoint, theano_one_hot, concatenate
 from kdllib import fetch_fruitspeech_spectrogram, list_iterator
 from kdllib import np_zeros, GRU, GRUFork, dense_to_one_hot
 from kdllib import make_weights, make_biases, relu, run_loop
@@ -36,9 +36,9 @@ if __name__ == "__main__":
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              stop_index=80, make_mask=True)
+                              stop_index=80, randomize=True, make_mask=True)
     valid_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              start_index=80, make_mask=True)
+                              start_index=80, randomize=True, make_mask=True)
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
     train_itr.reset()
 
@@ -236,7 +236,8 @@ if __name__ == "__main__":
     biases += h1_to_h3.get_biases()
     biases += h2_to_h3.get_biases()
 
-    outs_to_v_h1 = GRUFork(1, n_v_proj, random_state)
+    # 2 to include groundtruth, pixel RNN style
+    outs_to_v_h1 = GRUFork(2, n_v_proj, random_state)
     params += outs_to_v_h1.get_params()
     biases += outs_to_v_h1.get_biases()
 
@@ -251,12 +252,6 @@ if __name__ == "__main__":
 
     params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
     params += [h1_to_outs, h2_to_outs, h3_to_outs]
-
-    # Not used
-    l1_proj, l2_proj = make_weights(n_proj, [n_proj, n_proj], random_state,
-                                    init="fan")
-    l1_b, l2_b = make_biases([n_proj, n_proj])
-    #params += [l1_proj, l1_b, l2_proj, l2_b]
 
     pred_proj, = make_weights(n_proj * n_v_proj, [n_pred_proj], random_state)
     pred_b, = make_biases([n_pred_proj])
@@ -375,17 +370,20 @@ if __name__ == "__main__":
             h3_to_outs)
         theano.printing.Print("out_t.shape")(out_t.shape)
         out_t_shape = out_t.shape
+        x_tm1_shuf = x_tm1.dimshuffle(1, 0, 'x')
         vinp_t = out_t.dimshuffle(1, 0, 'x')
+        theano.printing.Print("x_tm1.shape")(x_tm1.shape)
         theano.printing.Print("vinp_t.shape")(vinp_t.shape)
-        def sample_out_step(v_t, v_h1_tm1):
-            vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(v_t)
-            v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        j_t = tensor.concatenate((x_tm1_shuf, vinp_t), axis=-1)
+        vinp_h1_t, vinpgate_h1_t = outs_to_v_h1.proj(j_t)
+        def sample_out_step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1):
+            v_h1_t = v_cell1.step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1)
             return v_h1_t
         init_corr_out_t = tensor.zeros((vinp_t.shape[1], n_v_proj))
         theano.printing.Print("init_corr_out_t.shape")(init_corr_out_t.shape)
         corr_out_t, isupdates = theano.scan(
             fn=sample_out_step,
-            sequences=[vinp_t],
+            sequences=[vinp_h1_t, vinpgate_h1_t],
             outputs_info=[init_corr_out_t])
         theano.printing.Print("corr_out_t.shape")(corr_out_t.shape)
         corr_out_t = corr_out_t.dimshuffle(1, 0, 2)
@@ -421,18 +419,28 @@ if __name__ == "__main__":
     outs = outs.dimshuffle(2, 1, 0)
     vinp = outs.reshape((outs_shape[2], -1, 1))
     shp = vinp.shape
-    vinp_h1, vinpgate_h1 = outs_to_v_h1.proj(vinp)
-    theano.printing.Print("vinp_h1.shape")(vinp_h1.shape)
-    theano.printing.Print("vinpgate_h1.shape")(vinpgate_h1.shape)
-    def out_step(v_t, v_h1_tm1):
-        vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(v_t)
+
+    shuff_inpt_shapes = inpt.shape
+    theano.printing.Print("inpt.shape")(inpt.shape)
+    shuff_inpt = inpt.dimshuffle(2, 1, 0)
+    theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
+    shuff_inpt = shuff_inpt.reshape((shuff_inpt_shapes[2],
+                                     shuff_inpt_shapes[1] * shuff_inpt_shapes[0],
+                                     1))
+
+    theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
+    theano.printing.Print("vinp.shape")(vinp.shape)
+    vinp_h1, vinpgate_h1 = outs_to_v_h1.proj(j)
+    def out_step(shuff_inpt_t, pred_t, v_h1_tm1):
+        j_t = concatenate((shuff_inpt_t, pred_t), axis=-1)
         v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
         return v_h1_t
 
-    init_corr_outs = tensor.zeros((vinp.shape[1], n_v_proj))
-    corr_outs, updates = theano.scan(
+    init_pre_pred = tensor.zeros((vinp.shape[1], 1))
+    init_hidden = tensor.zeros((shuff_inpt.shape[1], n_v_proj))
+    pre_pred, updates = theano.scan(
         fn=out_step,
-        sequences=[vinp],
+        sequences=[vinp_h1, vinpgate_h1],
         outputs_info=[init_corr_outs])
     theano.printing.Print("corr_outs.shape")(corr_outs.shape)
     corr_outs = corr_outs.dimshuffle(1, 0, 2)
@@ -455,9 +463,10 @@ if __name__ == "__main__":
     theano.printing.Print("target.shape")(target.shape)
 
     cost = cost * mask.dimshuffle(0, 1, 'x')
-    cost = cost.sum()
-    cost = cost / cut_len
-    cost = cost / minibatch_size
+    # sum over sequence length and features, mean over minibatch
+    cost = cost.dimshuffle(0, 2, 1)
+    cost = cost.reshape((-1, cost.shape[2]))
+    cost = cost.sum(axis=0).mean()
 
     l2_penalty = 0
     for p in list(set(params) - set(biases)):

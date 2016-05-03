@@ -36,9 +36,9 @@ if __name__ == "__main__":
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              stop_index=80, make_mask=True)
+                              stop_index=80, randomize=True, make_mask=True)
     valid_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              start_index=80, make_mask=True)
+                              start_index=80, randomize=True, make_mask=True)
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
     train_itr.reset()
 
@@ -424,15 +424,14 @@ if __name__ == "__main__":
     vinp_h1, vinpgate_h1 = outs_to_v_h1.proj(vinp)
     theano.printing.Print("vinp_h1.shape")(vinp_h1.shape)
     theano.printing.Print("vinpgate_h1.shape")(vinpgate_h1.shape)
-    def out_step(v_t, v_h1_tm1):
-        vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(v_t)
-        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+    def out_step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1):
+        v_h1_t = v_cell1.step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1)
         return v_h1_t
 
     init_corr_outs = tensor.zeros((vinp.shape[1], n_v_proj))
     corr_outs, updates = theano.scan(
         fn=out_step,
-        sequences=[vinp],
+        sequences=[vinp_h1, vinpgate_h1],
         outputs_info=[init_corr_outs])
     theano.printing.Print("corr_outs.shape")(corr_outs.shape)
     corr_outs = corr_outs.dimshuffle(1, 0, 2)
@@ -455,9 +454,10 @@ if __name__ == "__main__":
     theano.printing.Print("target.shape")(target.shape)
 
     cost = cost * mask.dimshuffle(0, 1, 'x')
-    cost = cost.sum()
-    cost = cost / cut_len
-    cost = cost / minibatch_size
+    # sum over sequence length and features, mean over minibatch
+    cost = cost.dimshuffle(0, 2, 1)
+    cost = cost.reshape((-1, cost.shape[2]))
+    cost = cost.sum(axis=0).mean()
 
     l2_penalty = 0
     for p in list(set(params) - set(biases)):
