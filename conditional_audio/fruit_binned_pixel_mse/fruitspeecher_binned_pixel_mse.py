@@ -32,7 +32,7 @@ if __name__ == "__main__":
     minibatch_size = 1
     n_epochs = 200  # Used way at the bottom in the training loop!
     checkpoint_every_n = 10
-    cut_len = 31  # Used way at the bottom in the training loop!
+    cut_len = 81  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
@@ -471,7 +471,11 @@ if __name__ == "__main__":
         sequences=[shuff_inpt, vinp],
         outputs_info=[init_pred, init_hidden])
     (pred, v_h1) = r
-    pred = pred.dimshuffle(1, 'x', 0)
+    theano.printing.Print("pred.shape")(pred.shape)
+    pred = pred.dimshuffle(1, 0)
+    target_shape = target.shape
+    # -1 fine for MSE, binomial
+    pred = pred.reshape((target_shape[0], minibatch_size, -1))
     v_h1 = v_h1.dimshuffle(2, 1, 0)
     theano.printing.Print("pred.shape")(pred.shape)
     theano.printing.Print("v_h1.shape")(v_h1.shape)
