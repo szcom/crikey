@@ -48,7 +48,7 @@ if __name__ == "__main__":
     n_v_proj = 5
     n_bins = 10
     input_dim = X_mb.shape[-1]
-    n_pred_proj = input_dim
+    n_pred_proj = 1
 
     n_feats = X_mb.shape[-1]
     n_chars = vocabulary_size
@@ -134,15 +134,15 @@ if __name__ == "__main__":
             else:
                 fixed_steps = args.sample_length
                 completed = []
-                init_x = np.zeros((minibatch_size, n_feats)).astype(theano.config.floatX)
-                init_x = X_mb[0]
+                init_x = np.zeros_like(X_mb[0])
                 for i in range(fixed_steps):
                     rvals = sample_function(init_x, c_mb, c_mb_mask, prev_h1, prev_h2,
                                             prev_h3, prev_kappa, prev_w)
                     sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
+                    # remove after retraining
+                    sampled = sampled.transpose(1, 0)
                     completed.append(sampled)
                     # cheating sampling...
-                    # super cheat
                     #init_x = X_mb[i]
                     init_x = sampled
                     prev_h1 = h1_s
@@ -154,6 +154,11 @@ if __name__ == "__main__":
                 print("Completed sampling after %i steps" % fixed_steps)
             completed = np.array(completed).transpose(1, 0, 2)
             rlookup = {v: k for k, v in vocabulary.items()}
+            all_strings = []
+            for yi in y:
+                ex_str = "".join([rlookup[c]
+                                  for c in np.argmax(yi, axis=1)])
+                all_strings.append(ex_str)
             for i in range(len(completed)):
                 ex = completed[i]
                 ex_str = "".join([rlookup[c]
@@ -161,10 +166,13 @@ if __name__ == "__main__":
                 s = "gen_%s_%i.wav" % (ex_str, i)
                 ii = reconstruct(ex)
                 wavfile.write(s, fs, soundsc(ii))
-
-                it = reconstruct(X[i])
-                s = "orig_%i.wav" % i
-                wavfile.write(s, fs, soundsc(it))
+                if ex_str in all_strings:
+                    inds = [n for n, s in enumerate(all_strings)
+                            if ex_str == s]
+                    ind = inds[0]
+                    it = reconstruct(X[ind])
+                    s = "orig_%s_%i.wav" % (ex_str, i)
+                    wavfile.write(s, fs, soundsc(it))
         valid_itr.reset()
         print("Sampling complete, exiting...")
         sys.exit()
@@ -236,8 +244,8 @@ if __name__ == "__main__":
     biases += h1_to_h3.get_biases()
     biases += h2_to_h3.get_biases()
 
-    # 2 to include groundtruth, pixel RNN style
-    outs_to_v_h1 = GRUFork(2, n_v_proj, random_state)
+    # 3 to include groundtruth, pixel RNN style
+    outs_to_v_h1 = GRUFork(3, n_v_proj, random_state)
     params += outs_to_v_h1.get_params()
     biases += outs_to_v_h1.get_biases()
 
@@ -253,7 +261,7 @@ if __name__ == "__main__":
     params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
     params += [h1_to_outs, h2_to_outs, h3_to_outs]
 
-    pred_proj, = make_weights(n_proj * n_v_proj, [n_pred_proj], random_state)
+    pred_proj, = make_weights(n_v_proj, [n_pred_proj], random_state)
     pred_b, = make_biases([n_pred_proj])
 
     params += [pred_proj, pred_b]
@@ -374,35 +382,38 @@ if __name__ == "__main__":
         vinp_t = out_t.dimshuffle(1, 0, 'x')
         theano.printing.Print("x_tm1.shape")(x_tm1.shape)
         theano.printing.Print("vinp_t.shape")(vinp_t.shape)
-        j_t = tensor.concatenate((x_tm1_shuf, vinp_t), axis=-1)
-        vinp_h1_t, vinpgate_h1_t = outs_to_v_h1.proj(j_t)
-        def sample_out_step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1):
-            v_h1_t = v_cell1.step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1)
-            return v_h1_t
-        init_corr_out_t = tensor.zeros((vinp_t.shape[1], n_v_proj))
-        theano.printing.Print("init_corr_out_t.shape")(init_corr_out_t.shape)
-        corr_out_t, isupdates = theano.scan(
+        init_pred = tensor.zeros((vinp_t.shape[1],), dtype=theano.config.floatX)
+        init_hidden = tensor.zeros((x_tm1_shuf.shape[1], n_v_proj),
+                                    dtype=theano.config.floatX)
+
+        def sample_out_step(x_tm1_shuf, vinp_t, pred_fm1, v_h1_tm1):
+            j_t = concatenate((x_tm1_shuf, vinp_t,
+                               pred_fm1.dimshuffle(0, 'x')),
+                               axis=-1)
+            theano.printing.Print("j_t.shape")(j_t.shape)
+            vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
+            v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+            theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+            pred_f = v_h1_t.dot(pred_proj) + pred_b
+            theano.printing.Print("pred_f.shape")(pred_f.shape)
+            return pred_f[:, 0], v_h1_t
+
+        r, isupdates = theano.scan(
             fn=sample_out_step,
-            sequences=[vinp_h1_t, vinpgate_h1_t],
-            outputs_info=[init_corr_out_t])
-        theano.printing.Print("corr_out_t.shape")(corr_out_t.shape)
-        corr_out_t = corr_out_t.dimshuffle(1, 0, 2)
-        theano.printing.Print("corr_out_t.shape")(corr_out_t.shape)
-        shp = corr_out_t.shape
-        corr_out_t = corr_out_t.reshape((shp[0], -1))
-        theano.printing.Print("corr_out_t.shape")(corr_out_t.shape)
-        pre_pred_t = corr_out_t.dot(pred_proj) + pred_b
-        theano.printing.Print("pre_pred_t.shape")(pre_pred_t.shape)
+            sequences=[x_tm1_shuf, vinp_t],
+            outputs_info=[init_pred, init_hidden])
+        (pred_t, v_h1_t) = r
+        theano.printing.Print("pred_t.shape")(pred_t.shape)
+        theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
         #pred_t = sigmoid(pre_pred_t)
         #x_t = sample_binomial(pred_t, n_bins, srng)
         # MSE
-        pred_t = pre_pred_t
         x_t = pred_t
-        theano.printing.Print("pred_t.shape")(pred_t.shape)
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
 
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, supdates) = sample_step(
         init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
+    sampled = sampled.dimshuffle(1, 0)
     theano.printing.Print("sampled.shape")(sampled.shape)
 
     (h1, h2, h3, kappa, w), updates = theano.scan(
@@ -418,6 +429,7 @@ if __name__ == "__main__":
     theano.printing.Print("outs.shape")(outs.shape)
     outs = outs.dimshuffle(2, 1, 0)
     vinp = outs.reshape((outs_shape[2], -1, 1))
+    theano.printing.Print("vinp.shape")(vinp.shape)
     shp = vinp.shape
 
     shuff_inpt_shapes = inpt.shape
@@ -430,34 +442,43 @@ if __name__ == "__main__":
 
     theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
     theano.printing.Print("vinp.shape")(vinp.shape)
-    vinp_h1, vinpgate_h1 = outs_to_v_h1.proj(j)
-    def out_step(shuff_inpt_t, pred_t, v_h1_tm1):
-        j_t = concatenate((shuff_inpt_t, pred_t), axis=-1)
+    # input from previous time, pred from previous feature
+    """
+    dimshuffle hacks and [:, 0] to avoid this error:
+    TypeError: Inconsistency in the inner graph of scan 'scan_fn' : an input
+    and an output are associated with the same recurrent state and should have
+    the same type but have type 'TensorType(float32, col)' and
+    'TensorType(float32, matrix)' respectively.
+    """
+    def out_step(shuff_inpt_tm1, vinp_t, pred_fm1, v_h1_tm1):
+        j_t = concatenate((shuff_inpt_tm1, vinp_t, pred_fm1.dimshuffle(0, 'x')),
+                           axis=-1)
+        theano.printing.Print("j_t.shape")(j_t.shape)
+        vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
         v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
-        return v_h1_t
+        theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+        pred_f = v_h1_t.dot(pred_proj) + pred_b
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        return pred_f[:, 0], v_h1_t
 
-    init_pre_pred = tensor.zeros((vinp.shape[1], 1))
-    init_hidden = tensor.zeros((shuff_inpt.shape[1], n_v_proj))
-    pre_pred, updates = theano.scan(
+    init_pred = tensor.zeros((vinp.shape[1],), dtype=theano.config.floatX)
+    init_hidden = tensor.zeros((shuff_inpt.shape[1], n_v_proj),
+                                dtype=theano.config.floatX)
+    theano.printing.Print("init_pred.shape")(init_pred.shape)
+    theano.printing.Print("init_hidden.shape")(init_hidden.shape)
+    r, updates = theano.scan(
         fn=out_step,
-        sequences=[vinp_h1, vinpgate_h1],
-        outputs_info=[init_corr_outs])
-    theano.printing.Print("corr_outs.shape")(corr_outs.shape)
-    corr_outs = corr_outs.dimshuffle(1, 0, 2)
-    corr_outs_shape = corr_outs.shape
-    theano.printing.Print("corr_outs.shape")(corr_outs.shape)
-    corr_outs = corr_outs.reshape((outs_shape[0], outs_shape[1], -1))
-    theano.printing.Print("corr_outs.shape")(corr_outs.shape)
-    shp = corr_outs.shape
-    corr_outs = corr_outs.reshape((-1, shp[2]))
-    theano.printing.Print("corr_outs.shape")(corr_outs.shape)
-    pre_pred = corr_outs.dot(pred_proj) + pred_b
-    theano.printing.Print("pre_pred.shape")(pre_pred.shape)
+        sequences=[shuff_inpt, vinp],
+        outputs_info=[init_pred, init_hidden])
+    (pred, v_h1) = r
+    pred = pred.dimshuffle(1, 'x', 0)
+    v_h1 = v_h1.dimshuffle(2, 1, 0)
+    theano.printing.Print("pred.shape")(pred.shape)
+    theano.printing.Print("v_h1.shape")(v_h1.shape)
     # binomial
     #pred = sigmoid(pre_pred.reshape((shp[0], shp[1], -1)))
     #cost = target * tensor.log(pred) + (n_bins - target) * tensor.log(1 - pred)
     # MSE
-    pred = pre_pred.reshape((shp[0], shp[1], -1))
     cost = (pred - target) ** 2
     theano.printing.Print("pred.shape")(pred.shape)
     theano.printing.Print("target.shape")(target.shape)
