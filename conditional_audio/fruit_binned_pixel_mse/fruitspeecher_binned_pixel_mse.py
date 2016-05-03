@@ -5,57 +5,51 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from scipy.io import wavfile
 import os
 import sys
-from kdllib import load_checkpoint, theano_one_hot
-from kdllib import fetch_fruitspeech_spectrogram_nonpar, list_iterator
+from kdllib import load_checkpoint, theano_one_hot, concatenate
+from kdllib import fetch_fruitspeech_spectrogram, list_iterator
 from kdllib import np_zeros, GRU, GRUFork, dense_to_one_hot
 from kdllib import make_weights, make_biases, relu, run_loop
 from kdllib import as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import soundsc, categorical_crossentropy
-from kdllib import sample_softmax, softmax
+from kdllib import sample_binomial, sigmoid
 
 
 
 if __name__ == "__main__":
     import argparse
 
-    speech = fetch_fruitspeech_spectrogram_nonpar()
-    X1 = speech["data1"]
-    X1_size = speech["data1_size"]
-    X2 = speech["data2"]
-    X2_size = speech["data2_size"]
+    speech = fetch_fruitspeech_spectrogram()
+    X = speech["data"]
     y = speech["target"]
     vocabulary = speech["vocabulary"]
     vocabulary_size = speech["vocabulary_size"]
     reconstruct = speech["reconstruct"]
     fs = speech["sample_rate"]
-    X1 = np.array([x.astype(theano.config.floatX) for x in X1])
-    X2 = np.array([x.astype(theano.config.floatX) for x in X2])
-    X = np.array([np.hstack((x1[:, None], x2[:, None]))
-                  for x1, x2 in zip(X1, X2)])
+    X = np.array([x.astype(theano.config.floatX) for x in X])
     y = np.array([yy.astype(theano.config.floatX) for yy in y])
 
-    minibatch_size = 20
-    n_epochs = 1000  # Used way at the bottom in the training loop!
-    checkpoint_every_n = 100
-    # Was 300
-    cut_len = 21  # Used way at the bottom in the training loop!
+    minibatch_size = 1
+    n_epochs = 200  # Used way at the bottom in the training loop!
+    checkpoint_every_n = 10
+    cut_len = 31  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              stop_index=80, make_mask=True)
+                              stop_index=105, randomize=True, make_mask=True)
     valid_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              start_index=80, make_mask=True)
+                              start_index=100, randomize=True, make_mask=True)
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
     train_itr.reset()
 
-
     n_hid = 256
     att_size = 10
-    n_proj = 1024
-    n_softmax1 = X1_size
-    n_softmax2 = X2_size
-    input_dim = (n_softmax1 + n_softmax2)
+    n_proj = 256
+    n_v_proj = 5
+    n_bins = 10
+    input_dim = X_mb.shape[-1]
+    n_pred_proj = 1
+
     n_feats = X_mb.shape[-1]
     n_chars = vocabulary_size
     # n_components = 3
@@ -136,61 +130,49 @@ if __name__ == "__main__":
                 c_mb_mask = np.ones_like(c_mb[:, :, 0])
 
             if args.sample_length is None:
-                # Automatic sampling stop as described in Graves' paper
-                # Assume an average of 30 timesteps per char
-                n_steps = 30 * c_mb.shape[0]
-                step_inc = n_steps
-                max_steps = 25000
-                max_steps_buf = max_steps + n_steps
-                completed = [np.zeros((max_steps_buf, X_mb.shape[-1]))
-                             for i in range(c_mb.shape[1])]
-                max_indices = [None] * c_mb.shape[1]
-                completed_indices = set()
-                # hardcoded upper limit
-                while n_steps < max_steps:
-                    rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                            prev_h3, prev_kappa, prev_w,
-                                            n_steps)
-                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                    for i in range(c_mb.shape[1]):
-                        max_ind = None
-                        for j in range(len(stop_s)):
-                            if np.all(stop_h[j, i] > stop_s[j, i]):
-                                max_ind = j
-
-                        if max_ind is not None:
-                            completed_indices = completed_indices | set([i])
-                            completed[i][:max_ind] = sampled[:max_ind, i]
-                            max_indices[i] = max_ind
-                    # if most samples meet the criteria call it good
-                    if len(completed_indices) >= .8 * c_mb.shape[1]:
-                        break
-                    n_steps += step_inc
-                print("Completed auto sampling after %i steps" % n_steps)
-                # cut out garbage
-                completed = [completed[i] for i in completed_indices]
-                cond = c_mb[:, np.array(list(completed_indices))]
+                raise ValueError("NYI - use -sl or --sample_length ")
             else:
                 fixed_steps = args.sample_length
-                rvals = sample_function(c_mb, c_mb_mask, prev_h1, prev_h2,
-                                        prev_h3, prev_kappa, prev_w,
-                                        fixed_steps)
-                sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
-                completed = [sampled[:, i]
-                             for i in range(sampled.shape[1])]
+                completed = []
+                init_x = np.zeros_like(X_mb[0])
+                for i in range(fixed_steps):
+                    rvals = sample_function(init_x, c_mb, c_mb_mask, prev_h1, prev_h2,
+                                            prev_h3, prev_kappa, prev_w)
+                    sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h = rvals
+                    # remove after retraining
+                    sampled = sampled.transpose(1, 0)
+                    completed.append(sampled)
+                    # cheating sampling...
+                    #init_x = X_mb[i]
+                    init_x = sampled
+                    prev_h1 = h1_s
+                    prev_h2 = h2_s
+                    prev_h3 = h3_s
+                    prev_kappa = k_s
+                    prev_w = w_s
                 cond = c_mb
                 print("Completed sampling after %i steps" % fixed_steps)
+            completed = np.array(completed).transpose(1, 0, 2)
             rlookup = {v: k for k, v in vocabulary.items()}
+            all_strings = []
+            for yi in y:
+                ex_str = "".join([rlookup[c]
+                                  for c in np.argmax(yi, axis=1)])
+                all_strings.append(ex_str)
             for i in range(len(completed)):
                 ex = completed[i]
                 ex_str = "".join([rlookup[c]
                                   for c in np.argmax(cond[:, i], axis=1)])
                 s = "gen_%s_%i.wav" % (ex_str, i)
-                ii = reconstruct(ex[:, 0], ex[:, 1])
+                ii = reconstruct(ex)
                 wavfile.write(s, fs, soundsc(ii))
-                #it = reconstruct(X[0])
-                #wavfile.write("orig.wav", fs, soundsc(it))
-                # plot_lines_iamondb_example(ex, title=ex_str, save_name=s)
+                if ex_str in all_strings:
+                    inds = [n for n, s in enumerate(all_strings)
+                            if ex_str == s]
+                    ind = inds[0]
+                    it = reconstruct(X[ind])
+                    s = "orig_%s_%i.wav" % (ex_str, i)
+                    wavfile.write(s, fs, soundsc(it))
         valid_itr.reset()
         print("Sampling complete, exiting...")
         sys.exit()
@@ -232,16 +214,9 @@ if __name__ == "__main__":
     params += cell2.get_params()
     params += cell3.get_params()
 
-    # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
-    inp_proj, = make_weights(input_dim, [n_hid], random_state)
-    inp_b, = make_biases([n_hid])
-
-    params += [inp_proj, inp_b]
-    biases += [inp_b]
-
-    inp_to_h1 = GRUFork(n_hid, n_hid, random_state)
-    inp_to_h2 = GRUFork(n_hid, n_hid, random_state)
-    inp_to_h3 = GRUFork(n_hid, n_hid, random_state)
+    inp_to_h1 = GRUFork(input_dim, n_hid, random_state)
+    inp_to_h2 = GRUFork(input_dim, n_hid, random_state)
+    inp_to_h3 = GRUFork(input_dim, n_hid, random_state)
     att_to_h1 = GRUFork(n_chars, n_hid, random_state)
     att_to_h2 = GRUFork(n_chars, n_hid, random_state)
     att_to_h3 = GRUFork(n_chars, n_hid, random_state)
@@ -269,6 +244,14 @@ if __name__ == "__main__":
     biases += h1_to_h3.get_biases()
     biases += h2_to_h3.get_biases()
 
+    # 3 to include groundtruth, pixel RNN style
+    outs_to_v_h1 = GRUFork(3, n_v_proj, random_state)
+    params += outs_to_v_h1.get_params()
+    biases += outs_to_v_h1.get_biases()
+
+    v_cell1 = GRU(n_v_proj, n_v_proj, random_state)
+    params += v_cell1.get_params()
+
     h1_to_att_a, h1_to_att_b, h1_to_att_k = make_weights(n_hid, 3 * [att_size],
                                                          random_state)
     h1_to_outs, = make_weights(n_hid, [n_proj], random_state)
@@ -278,32 +261,20 @@ if __name__ == "__main__":
     params += [h1_to_att_a, h1_to_att_b, h1_to_att_k]
     params += [h1_to_outs, h2_to_outs, h3_to_outs]
 
-    # Not used
-    l1_proj, l2_proj = make_weights(n_proj, [n_proj, n_proj], random_state,
-                                    init="fan")
-    l1_b, l2_b = make_biases([n_proj, n_proj])
-    #params += [l1_proj, l1_b, l2_proj, l2_b]
+    pred_proj, = make_weights(n_v_proj, [n_pred_proj], random_state)
+    pred_b, = make_biases([n_pred_proj])
 
-    softmax1_proj, = make_weights(n_proj, [n_softmax1], random_state)
-    softmax1_b, = make_biases([n_softmax1])
-    softmax2_proj, = make_weights(n_proj, [n_softmax2], random_state)
-    softmax2_b, = make_biases([n_softmax2])
-
-    params += [softmax1_proj, softmax1_b, softmax2_proj, softmax2_b]
-    biases += [softmax1_b, softmax2_b]
+    params += [pred_proj, pred_b]
+    biases += [pred_b]
 
     inpt = X_sym[:-1]
     target = X_sym[1:]
     mask = X_mask_sym[1:]
     context = c_sym * c_mask_sym.dimshuffle(0, 1, 'x')
 
-    pt1 = theano_one_hot(inpt[:, :, 0], n_classes=n_softmax1)
-    pt2 = theano_one_hot(inpt[:, :, 1], n_classes=n_softmax2)
-    inpt = tensor.concatenate((pt1, pt2), axis=-1)
-    inpt_reduced = inpt.dot(inp_proj) + inp_b
-    inp_h1, inpgate_h1 = inp_to_h1.proj(inpt_reduced)
-    inp_h2, inpgate_h2 = inp_to_h2.proj(inpt_reduced)
-    inp_h3, inpgate_h3 = inp_to_h3.proj(inpt_reduced)
+    inp_h1, inpgate_h1 = inp_to_h1.proj(inpt)
+    inp_h2, inpgate_h2 = inp_to_h2.proj(inpt)
+    inp_h3, inpgate_h3 = inp_to_h3.proj(inpt)
 
     u = tensor.arange(c_sym.shape[0]).dimshuffle('x', 'x', 0)
     u = tensor.cast(u, theano.config.floatX)
@@ -356,29 +327,19 @@ if __name__ == "__main__":
                           h3_tm1)
         return h1_t, h2_t, h3_t, k_t, w_t
 
-    init_x = as_shared(np_zeros((minibatch_size, n_feats)))
+
+    init_x = tensor.fmatrix()
+    init_x.tag.test_value = np_zeros((minibatch_size, n_feats)).astype(theano.config.floatX)
     srng = RandomStreams(1999)
 
     # Used to calculate stopping heuristic from sections 5.3
     u_max = 0. * tensor.arange(c_sym.shape[0]) + c_sym.shape[0]
     u_max = u_max.dimshuffle('x', 'x', 0)
     u_max = tensor.cast(u_max, theano.config.floatX)
-
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1, k_tm1, w_tm1, ctx):
-        theano.printing.Print("x_tm1.shape")(x_tm1.shape)
-        pt1 = theano_one_hot(x_tm1[:, 0],
-                             n_classes=n_softmax1)
-        theano.printing.Print("pt1.shape")(pt1.shape)
-        pt2 = theano_one_hot(x_tm1[:, 1],
-                             n_classes=n_softmax2)
-        theano.printing.Print("pt2.shape")(pt2.shape)
-        x_tm1 = tensor.concatenate((pt1, pt2), axis=-1)
-        theano.printing.Print("x_tm1.shape")(x_tm1.shape)
-        x_tm1_reduced = x_tm1.dot(inp_proj) + inp_b
-        theano.printing.Print("x_tm1_reduced.shape")(x_tm1_reduced.shape)
-        xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1_reduced)
-        xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1_reduced)
-        xinp_h3_t, xgate_h3_t = inp_to_h3.proj(x_tm1_reduced)
+        xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
+        xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1)
+        xinp_h3_t, xgate_h3_t = inp_to_h3.proj(x_tm1)
 
         attinp_h1, attgate_h1 = att_to_h1.proj(w_tm1)
 
@@ -415,46 +376,46 @@ if __name__ == "__main__":
                           h3_tm1)
         out_t = h1_t.dot(h1_to_outs) + h2_t.dot(h2_to_outs) + h3_t.dot(
             h3_to_outs)
-        #l1_t = relu(out_t.dot(l1_proj) + l1_b)
-        #l2_t = relu(l1_t.dot(l2_proj) + l2_b)
-        pred1_t = softmax(out_t.dot(softmax1_proj) + softmax1_b)
-        pred2_t = softmax(out_t.dot(softmax2_proj) + softmax2_b)
+        theano.printing.Print("out_t.shape")(out_t.shape)
+        out_t_shape = out_t.shape
+        x_tm1_shuf = x_tm1.dimshuffle(1, 0, 'x')
+        vinp_t = out_t.dimshuffle(1, 0, 'x')
+        theano.printing.Print("x_tm1.shape")(x_tm1.shape)
+        theano.printing.Print("vinp_t.shape")(vinp_t.shape)
+        init_pred = tensor.zeros((vinp_t.shape[1],), dtype=theano.config.floatX)
+        init_hidden = tensor.zeros((x_tm1_shuf.shape[1], n_v_proj),
+                                    dtype=theano.config.floatX)
 
-        s1_t = sample_softmax(pred1_t, srng)
-        theano.printing.Print("s1_t.shape")(s1_t.shape)
-        s2_t = sample_softmax(pred2_t, srng)
-        theano.printing.Print("s2_t.shape")(s2_t.shape)
-        s1_t = s1_t.dimshuffle(0, 'x')
-        theano.printing.Print("s1_t.shape")(s1_t.shape)
-        s2_t = s2_t.dimshuffle(0, 'x')
-        theano.printing.Print("s2_t.shape")(s2_t.shape)
-        x_t = tensor.concatenate((s1_t, s2_t), axis=1)
-        theano.printing.Print("x_t.shape")(x_t.shape)
-        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t
+        def sample_out_step(x_tm1_shuf, vinp_t, pred_fm1, v_h1_tm1):
+            j_t = concatenate((x_tm1_shuf, vinp_t,
+                               pred_fm1.dimshuffle(0, 'x')),
+                               axis=-1)
+            theano.printing.Print("j_t.shape")(j_t.shape)
+            vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
+            v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+            theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+            pred_f = v_h1_t.dot(pred_proj) + pred_b
+            theano.printing.Print("pred_f.shape")(pred_f.shape)
+            return pred_f[:, 0], v_h1_t
 
+        r, isupdates = theano.scan(
+            fn=sample_out_step,
+            sequences=[x_tm1_shuf, vinp_t],
+            outputs_info=[init_pred, init_hidden])
+        (pred_t, v_h1_t) = r
+        theano.printing.Print("pred_t.shape")(pred_t.shape)
+        theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+        #pred_t = sigmoid(pre_pred_t)
+        #x_t = sample_binomial(pred_t, n_bins, srng)
+        # MSE
+        x_t = pred_t
+        return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
 
-    n_steps_sym = tensor.iscalar()
-    n_steps_sym.tag.test_value = 10
-    # Can't do test values with sampling?
-    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h), supdates = theano.scan(
-        fn=sample_step,
-        n_steps=n_steps_sym,
-        sequences=[],
-        outputs_info=[init_x, init_h1, init_h2, init_h3,
-                      init_kappa, init_w, None, None],
-        non_sequences=[context])
+    (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, supdates) = sample_step(
+        init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
+    sampled = sampled.dimshuffle(1, 0)
     theano.printing.Print("sampled.shape")(sampled.shape)
 
-    """
-    # Testing step function
-    r = step(inp_h1[0], inpgate_h1[0], inp_h2[0], inpgate_h2[0],
-             inp_h3[0], inpgate_h3[0],
-             init_h1, init_h2, init_h3, init_kappa, init_w, context)
-
-    r = step(inp_h1[1], inpgate_h1[1], inp_h2[1], inpgate_h2[1],
-             inp_h3[1], inpgate_h3[1],
-             r[0], r[1], r[2], r[3], r[4], context)
-    """
     (h1, h2, h3, kappa, w), updates = theano.scan(
         fn=step,
         sequences=[inp_h1, inpgate_h1,
@@ -464,52 +425,69 @@ if __name__ == "__main__":
         non_sequences=[context])
 
     outs = h1.dot(h1_to_outs) + h2.dot(h2_to_outs) + h3.dot(h3_to_outs)
-    theano.printing.Print("outs.shape")(outs.shape)
     outs_shape = outs.shape
+    theano.printing.Print("outs.shape")(outs.shape)
+    outs = outs.dimshuffle(2, 1, 0)
+    vinp = outs.reshape((outs_shape[2], -1, 1))
+    theano.printing.Print("vinp.shape")(vinp.shape)
+    shp = vinp.shape
 
-    #l1 = relu(outs.dot(l1_proj) + l1_b)
-    #l2 = relu(l1.dot(l2_proj) + l2_b)
-    #theano.printing.Print("l1.shape")(l1.shape)
-    #theano.printing.Print("l2.shape")(l2.shape)
+    shuff_inpt_shapes = inpt.shape
+    theano.printing.Print("inpt.shape")(inpt.shape)
+    shuff_inpt = inpt.dimshuffle(2, 1, 0)
+    theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
+    shuff_inpt = shuff_inpt.reshape((shuff_inpt_shapes[2],
+                                     shuff_inpt_shapes[1] * shuff_inpt_shapes[0],
+                                     1))
 
-    pred1 = softmax(outs.dot(softmax1_proj) + softmax1_b)
-    pred2 = softmax(outs.dot(softmax2_proj) + softmax2_b)
-    theano.printing.Print("pred1.shape")(pred1.shape)
-    theano.printing.Print("pred2.shape")(pred2.shape)
+    theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
+    theano.printing.Print("vinp.shape")(vinp.shape)
+    # input from previous time, pred from previous feature
+    """
+    dimshuffle hacks and [:, 0] to avoid this error:
+    TypeError: Inconsistency in the inner graph of scan 'scan_fn' : an input
+    and an output are associated with the same recurrent state and should have
+    the same type but have type 'TensorType(float32, col)' and
+    'TensorType(float32, matrix)' respectively.
+    """
+    def out_step(shuff_inpt_tm1, vinp_t, pred_fm1, v_h1_tm1):
+        j_t = concatenate((shuff_inpt_tm1, vinp_t, pred_fm1.dimshuffle(0, 'x')),
+                           axis=-1)
+        theano.printing.Print("j_t.shape")(j_t.shape)
+        vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
+        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+        pred_f = v_h1_t.dot(pred_proj) + pred_b
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        return pred_f[:, 0], v_h1_t
 
-
-    # Make one hot targets
+    init_pred = tensor.zeros((vinp.shape[1],), dtype=theano.config.floatX)
+    init_hidden = tensor.zeros((shuff_inpt.shape[1], n_v_proj),
+                                dtype=theano.config.floatX)
+    theano.printing.Print("init_pred.shape")(init_pred.shape)
+    theano.printing.Print("init_hidden.shape")(init_hidden.shape)
+    r, updates = theano.scan(
+        fn=out_step,
+        sequences=[shuff_inpt, vinp],
+        outputs_info=[init_pred, init_hidden])
+    (pred, v_h1) = r
+    pred = pred.dimshuffle(1, 'x', 0)
+    v_h1 = v_h1.dimshuffle(2, 1, 0)
+    theano.printing.Print("pred.shape")(pred.shape)
+    theano.printing.Print("v_h1.shape")(v_h1.shape)
+    # binomial
+    #pred = sigmoid(pre_pred.reshape((shp[0], shp[1], -1)))
+    #cost = target * tensor.log(pred) + (n_bins - target) * tensor.log(1 - pred)
+    # MSE
+    cost = (pred - target) ** 2
+    theano.printing.Print("pred.shape")(pred.shape)
     theano.printing.Print("target.shape")(target.shape)
-    target1 = target[:, :, 0]
-    target2 = target[:, :, 1]
-    theano.printing.Print("target1.shape")(target1.shape)
-    theano.printing.Print("target2.shape")(target2.shape)
 
-    shp = target1.shape
-    target1 = target1.ravel()
-    target1 = theano_one_hot(target1, n_classes=n_softmax1)
-    target1 = target1.reshape((shp[0], shp[1], n_softmax1))
-    theano.printing.Print("target1.shape")(target1.shape)
-
-    shp = target2.shape
-    target2 = target2.ravel()
-    target2 = theano_one_hot(target2, n_classes=n_softmax2)
-    target2 = target2.reshape((shp[0], shp[1], n_softmax2))
-    theano.printing.Print("target2.shape")(target2.shape)
-
-    cost1 = categorical_crossentropy(pred1, target1)
-    cost2 = categorical_crossentropy(pred2, target2)
-    theano.printing.Print("cost1.shape")(cost1.shape)
-    theano.printing.Print("cost2.shape")(cost2.shape)
-
-    # Used to upweight cost1
-    ratio1 = n_softmax2 / float(n_softmax1 + n_softmax2)
-    # Used to downweight cost2
-    ratio2 = n_softmax1 / float(n_softmax1 + n_softmax2)
-
-    cost = cost1 * ratio1 + cost2 * ratio2
-    cost = cost * mask
-    cost = cost.sum() / (cut_len * minibatch_size)
+    cost = cost * mask.dimshuffle(0, 1, 'x')
+    # sum over sequence length and features, mean over minibatch
+    cost = cost.dimshuffle(0, 2, 1)
+    cost = cost.reshape((-1, cost.shape[2]))
+    cost = cost.sum(axis=0).mean()
 
     l2_penalty = 0
     for p in list(set(params) - set(biases)):
@@ -561,11 +539,11 @@ if __name__ == "__main__":
                                               init_h1, init_h2, init_h3, init_kappa,
                                               init_w],
                                              [kappa, w], on_unused_input='warn')
-        sample_function = theano.function([c_sym, c_mask_sym, init_h1, init_h2,
-                                           init_h3, init_kappa, init_w,
-                                           n_steps_sym],
+        sample_function = theano.function([init_x, c_sym, c_mask_sym, init_h1, init_h2,
+                                           init_h3, init_kappa, init_w],
                                           [sampled, h1_s, h2_s, h3_s, k_s, w_s,
                                            stop_s, stop_h],
+                                          on_unused_input="warn",
                                           updates=supdates)
         print("Beginning training loop")
         checkpoint_dict = {}
@@ -587,11 +565,7 @@ if __name__ == "__main__":
         for n in range(n_cuts):
             start = n * cut_len
             stop = (n + 1) * cut_len
-            if len(X_mb[start:stop]) <= 1:
-                break
-            """
-            # Extended masking breaks learning? Wut
-            if len(X_mb[start:stop]) <= cut_len:
+            if len(X_mb[start:stop]) < cut_len:
                 new_len = cut_len - len(X_mb) % cut_len
                 zeros = np.zeros((new_len, X_mb.shape[1],
                                   X_mb.shape[2]))
@@ -602,7 +576,6 @@ if __name__ == "__main__":
                 X_mb_mask = np.concatenate((X_mb_mask, mask_zeros), axis=0)
                 assert len(X_mb[start:stop]) == cut_len
                 assert len(X_mb_mask[start:stop]) == cut_len
-            """
             rval = function(X_mb[start:stop],
                             X_mb_mask[start:stop],
                             c_mb, c_mb_mask,
@@ -619,4 +592,4 @@ if __name__ == "__main__":
 
 run_loop(_loop, train_function, train_itr, cost_function, valid_itr,
          n_epochs=n_epochs, checkpoint_dict=checkpoint_dict,
-         checkpoint_every_n=checkpoint_every_n)
+         checkpoint_every_n=checkpoint_every_n, skip_minimums=True)

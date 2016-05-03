@@ -82,7 +82,8 @@ def soundsc(X, copy=True):
     X = (X - X.min()) / (X.max() - X.min())
     X = .9 * X
     X = 2 * X - 1
-    return X.astype('float32')
+    X = X * 2 ** 15
+    return X.astype('int16')
 
 
 def get_script_name():
@@ -3857,8 +3858,8 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
-             checkpoint_delay=10, checkpoint_every_n=100,
-             monitor_frequency=100, skip_minimums=False):
+             checkpoint_delay=10, checkpoint_every_n=10,
+             monitor_frequency=1000, skip_minimums=False):
     """
     loop function should return a list of costs
     """
@@ -3868,8 +3869,6 @@ def run_loop(loop_function, train_function, train_itr,
 
     _loop = loop_function
     ident = str(uuid.uuid4())[:8]
-    train_mb_count = 0
-    valid_mb_count = 0
     random_state = np.random.RandomState(2177)
     monitor_prob = 1. / monitor_frequency
 
@@ -3950,31 +3949,42 @@ def run_loop(loop_function, train_function, train_itr,
     best_train_checkpoint_epoch = 0
     best_valid_checkpoint_pickle = None
     best_train_checkpoint_epoch = 0
+    # If there are more than 1M minibatches per epoch this will break!
+    # Not reallocating buffer greatly helps fast training models though
+    train_costs = [0.] * 1000000
+    valid_costs = [0.] * 1000000
     try:
         for e in range(start_epoch, start_epoch + n_epochs):
             joint_start = time.time()
             epoch_start = time.time()
-            train_costs = []
             print(" ")
             print("starting training, epoch %i" % e)
             print(" ")
+            train_mb_count = 0
+            valid_mb_count = 0
+            results_dict = {k: v for k, v in checkpoint_dict.items()
+                            if k not in ignore_keys}
+            this_results_dict = results_dict
+            results_save_path = "%s_intermediate_results.html" % ident
             try:
                 train_start = time.time()
                 while True:
                     partial_train_costs = _loop(train_function, train_itr)
-                    train_costs.append(np.mean(partial_train_costs))
+                    train_costs[train_mb_count] = np.mean(partial_train_costs)
+                    train_mb_count += 1
                     draw = random_state.rand()
                     if draw < monitor_prob:
                         print(" ")
                         print("starting train mb %i" % train_mb_count)
                         print("current epoch mean cost %f" % np.mean(train_costs))
                         print(" ")
+                        this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
+                        thw.send((results_save_path, this_results_dict))
                     else:
                         print(".", end="")
-                    train_mb_count += 1
             except StopIteration:
                 train_stop = time.time()
-                valid_costs = []
+                train_costs = train_costs[:train_mb_count]
                 print(" ")
                 print("starting validation, epoch %i" % e)
                 print(" ")
@@ -3982,7 +3992,8 @@ def run_loop(loop_function, train_function, train_itr,
                 try:
                     while True:
                         partial_valid_costs = _loop(valid_function, valid_itr)
-                        valid_costs.append(np.mean(partial_valid_costs))
+                        valid_costs[valid_mb_count] = np.mean(partial_valid_costs)
+                        valid_mb_count += 1
                         draw = random_state.rand()
                         if draw < monitor_prob:
                             print(" ")
@@ -3990,14 +4001,16 @@ def run_loop(loop_function, train_function, train_itr,
                             print("current validation mean cost %f" % np.mean(
                                 valid_costs))
                             print(" ")
+                            this_results_dict["this_epoch_valid_auto"] = valid_costs[:valid_mb_count]
+                            thw.send((results_save_path, this_results_dict))
                         else:
                             print(".", end="")
-                        valid_mb_count += 1
                 except StopIteration:
                     pass
                 print(" ")
                 valid_stop = time.time()
                 epoch_stop = time.time()
+                valid_costs = valid_costs[:valid_mb_count]
 
                 # Logging and tracking training statistics
                 epoch_time_delta = epoch_stop - epoch_start
