@@ -12,7 +12,7 @@ from kdllib import make_weights, make_biases, relu, run_loop
 from kdllib import as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import soundsc, categorical_crossentropy
-from kdllib import sample_binomial, sigmoid
+from kdllib import sample_softmax, softmax
 
 
 
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     n_v_proj = 5
     n_bins = 10
     input_dim = X_mb.shape[-1]
-    n_pred_proj = 1
+    n_pred_proj = 10
 
     n_feats = X_mb.shape[-1]
     n_chars = vocabulary_size
@@ -378,42 +378,67 @@ if __name__ == "__main__":
         theano.printing.Print("out_t.shape")(out_t.shape)
         out_t_shape = out_t.shape
         x_tm1_shuf = x_tm1.dimshuffle(1, 0, 'x')
+        theano.printing.Print("x_tm1_shuf.shape")(x_tm1_shuf.shape)
         vinp_t = out_t.dimshuffle(1, 0, 'x')
         theano.printing.Print("x_tm1.shape")(x_tm1.shape)
         theano.printing.Print("vinp_t.shape")(vinp_t.shape)
-        init_pred = tensor.zeros((vinp_t.shape[1],), dtype=theano.config.floatX)
-        init_hidden = tensor.zeros((x_tm1_shuf.shape[1], n_v_proj),
+        # set probability of 0 amplitude high at dc
+        init_pred = tensor.ones((vinp_t.shape[1], n_bins),
+                                 dtype=theano.config.floatX)
+        init_pred = init_pred * tensor.eye(n_bins)[0].dimshuffle('x', 0)
+        init_hidden = tensor.zeros((vinp_t.shape[1], n_v_proj),
                                     dtype=theano.config.floatX)
 
-        def sample_out_step(x_tm1_shuf, vinp_t, pred_fm1, v_h1_tm1):
-            j_t = concatenate((x_tm1_shuf, vinp_t,
-                               pred_fm1.dimshuffle(0, 'x')),
+        # Why on earth do I have to do this concatenation dance.
+        # Seems like a bug...
+        def sample_out_step(x_tm1_shuf, vinp_f, pred_fm1, v_h1_fm1):
+            theano.printing.Print("pred_fm1.shape")(pred_fm1.shape)
+            samp_fm1 = sample_softmax(pred_fm1, srng).dimshuffle(0, 'x')
+            theano.printing.Print("samp_fm1.shape")(samp_fm1.shape)
+            j_f = concatenate((x_tm1_shuf, vinp_f,
+                               samp_fm1),
                                axis=-1)
-            theano.printing.Print("j_t.shape")(j_t.shape)
-            vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
-            v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
-            theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
-            pred_f = v_h1_t.dot(pred_proj) + pred_b
-            # clip MSE estimate... not perfect
-            #pred_f = tensor.clip(pred_f, 0 + 0.01, n_bins - 0.01)
-            #pred_f = tensor.floor(pred_f)
-            return pred_f[:, 0], v_h1_t
+            theano.printing.Print("j_f.shape")(j_f.shape)
+            vinp_h1_f, vgate_h1_f = outs_to_v_h1.proj(j_f)
+            v_h1_f = v_cell1.step(vinp_h1_f, vgate_h1_f, v_h1_fm1)
+            theano.printing.Print("v_h1_f.shape")(v_h1_f.shape)
+            pred_f = v_h1_f.dot(pred_proj) + pred_b
+            theano.printing.Print("pred_f.shape")(pred_f.shape)
+            return pred_f, v_h1_f, samp_fm1
+
+        """
+        # unrolls fine but scan barfs... :(
+        r = sample_out_step(x_tm1_shuf[0], vinp_t[0], init_pred, init_hidden)
+        pred_f, v_h1_f = r
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        theano.printing.Print("v_h1_f.shape")(v_h1_f.shape)
+
+        r = sample_out_step(x_tm1_shuf[1], vinp_t[1], pred_f, v_h1_f)
+        pred_f, v_h1_f = r
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        theano.printing.Print("v_h1_f.shape")(v_h1_f.shape)
+
+        r = sample_out_step(x_tm1_shuf[1], vinp_t[1], pred_f, v_h1_f)
+        pred_f, v_h1_f = r
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        theano.printing.Print("v_h1_f.shape")(v_h1_f.shape)
+        raise ValueError()
+        """
 
         r, isupdates = theano.scan(
             fn=sample_out_step,
             sequences=[x_tm1_shuf, vinp_t],
-            outputs_info=[init_pred, init_hidden])
-        (pred_t, v_h1_t) = r
+            outputs_info=[init_pred, init_hidden, None])
+        (pred_t, v_h1_t, samp_t) = r
         theano.printing.Print("pred_t.shape")(pred_t.shape)
+        theano.printing.Print("samp_t.shape")(samp_t.shape)
         theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
-        #pred_t = sigmoid(pre_pred_t)
-        #x_t = sample_binomial(pred_t, n_bins, srng)
-        # MSE
-        x_t = pred_t
+        x_t = samp_t
         return x_t, h1_t, h2_t, h3_t, k_t, w_t, ss_t, sh_t, isupdates
 
     (sampled, h1_s, h2_s, h3_s, k_s, w_s, stop_s, stop_h, supdates) = sample_step(
         init_x, init_h1, init_h2, init_h3, init_kappa, init_w, c_sym)
+    theano.printing.Print("sampled.shape")(sampled.shape)
     sampled = sampled.dimshuffle(1, 0)
     theano.printing.Print("sampled.shape")(sampled.shape)
 
@@ -474,22 +499,20 @@ if __name__ == "__main__":
     pre_pred = pre_pred.reshape((minibatch_size, shp[0] // minibatch_size,
                                  shp[1], shp[2]))
     pre_pred = pre_pred.dimshuffle(1, 0, 2, 3)
-    # For mse / binomial just slice the end off...
-    pred = pre_pred[:, :, :, 0]
-    theano.printing.Print("pred.shape")(pred.shape)
-    theano.printing.Print("v_h1.shape")(v_h1.shape)
-    # binomial
-    #pred = sigmoid(pre_pred.reshape((shp[0], shp[1], -1)))
-    #cost = target * tensor.log(pred) + (n_bins - target) * tensor.log(1 - pred)
-    # MSE
-    cost = (pred - target) ** 2
-    theano.printing.Print("pred.shape")(pred.shape)
+    theano.printing.Print("pre_pred.shape")(pre_pred.shape)
+    pred = softmax(pre_pred)
     theano.printing.Print("target.shape")(target.shape)
+    target = theano_one_hot(target, n_classes=n_bins)
+    theano.printing.Print("target.shape")(target.shape)
+    theano.printing.Print("pred.shape")(pred.shape)
 
+    cost = categorical_crossentropy(pred, target)
     cost = cost * mask.dimshuffle(0, 1, 'x')
     # sum over sequence length and features, mean over minibatch
     cost = cost.dimshuffle(0, 2, 1)
+    theano.printing.Print("cost.shape")(cost.shape)
     cost = cost.reshape((-1, cost.shape[2]))
+    theano.printing.Print("cost.shape")(cost.shape)
     cost = cost.sum(axis=0).mean()
 
     l2_penalty = 0

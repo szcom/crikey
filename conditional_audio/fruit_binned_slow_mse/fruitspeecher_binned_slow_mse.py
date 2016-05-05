@@ -38,8 +38,7 @@ if __name__ == "__main__":
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
                               stop_index=105, randomize=True, make_mask=True)
     valid_itr = list_iterator([X, y], minibatch_size, axis=1,
-                              start_index=105 - minibatch_size,
-                              randomize=True, make_mask=True)
+                              start_index=80, randomize=True, make_mask=True)
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
     train_itr.reset()
 
@@ -394,9 +393,7 @@ if __name__ == "__main__":
             v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
             theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
             pred_f = v_h1_t.dot(pred_proj) + pred_b
-            # clip MSE estimate... not perfect
-            #pred_f = tensor.clip(pred_f, 0 + 0.01, n_bins - 0.01)
-            #pred_f = tensor.floor(pred_f)
+            theano.printing.Print("pred_f.shape")(pred_f.shape)
             return pred_f[:, 0], v_h1_t
 
         r, isupdates = theano.scan(
@@ -444,47 +441,51 @@ if __name__ == "__main__":
     theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
     theano.printing.Print("vinp.shape")(vinp.shape)
     # input from previous time, pred from previous feature
-    true_f = tensor.zeros_like(target)
-    # Target *just* offset in frequency so we can use it
-    true_f = tensor.set_subtensor(true_f[:, :, 1:], target[:, :, :-1])
-    true_f = true_f.dimshuffle(2, 0, 1)
-    true_f_shapes = true_f.shape
-    true_f = true_f.reshape((true_f_shapes[0],
-                             true_f_shapes[1] * true_f_shapes[2], 1))
-    theano.printing.Print("shuff_inpt.shape")(shuff_inpt.shape)
-    theano.printing.Print("vinp.shape")(shuff_inpt.shape)
-    theano.printing.Print("true_f.shape")(true_f.shape)
-    j = concatenate((shuff_inpt, vinp, true_f), axis=-1)
-    vinp_h1, vgate_h1 = outs_to_v_h1.proj(j)
-    def out_step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1):
-        v_h1_t = v_cell1.step(vinp_h1_t, vinpgate_h1_t, v_h1_tm1)
-        return v_h1_t
+    """
+    dimshuffle hacks and [:, 0] to avoid this error:
+    TypeError: Inconsistency in the inner graph of scan 'scan_fn' : an input
+    and an output are associated with the same recurrent state and should have
+    the same type but have type 'TensorType(float32, col)' and
+    'TensorType(float32, matrix)' respectively.
+    """
+    def out_step(shuff_inpt_tm1, vinp_t, pred_fm1, v_h1_tm1):
+        j_t = concatenate((shuff_inpt_tm1, vinp_t, pred_fm1.dimshuffle(0, 'x')),
+                           axis=-1)
+        theano.printing.Print("j_t.shape")(j_t.shape)
+        vinp_h1_t, vgate_h1_t = outs_to_v_h1.proj(j_t)
+        v_h1_t = v_cell1.step(vinp_h1_t, vgate_h1_t, v_h1_tm1)
+        theano.printing.Print("v_h1_t.shape")(v_h1_t.shape)
+        pred_f = v_h1_t.dot(pred_proj) + pred_b
+        theano.printing.Print("pred_f.shape")(pred_f.shape)
+        return pred_f[:, 0], v_h1_t
 
+    init_pred = tensor.zeros((vinp.shape[1],), dtype=theano.config.floatX)
     init_hidden = tensor.zeros((shuff_inpt.shape[1], n_v_proj),
                                 dtype=theano.config.floatX)
+    theano.printing.Print("init_pred.shape")(init_pred.shape)
     theano.printing.Print("init_hidden.shape")(init_hidden.shape)
-    v_h1, updates = theano.scan(
+    r, updates = theano.scan(
         fn=out_step,
-        sequences=[vinp_h1, vgate_h1],
-        outputs_info=[init_hidden])
-    pre_pred = v_h1.dot(pred_proj) + pred_b
-    pre_pred = pre_pred.dimshuffle(1, 0, 2)
-    shp = pre_pred.shape
-    # Have to undo the minibatch_size * time features the same way they came in
-    pre_pred = pre_pred.reshape((minibatch_size, shp[0] // minibatch_size,
-                                 shp[1], shp[2]))
-    pre_pred = pre_pred.dimshuffle(1, 0, 2, 3)
-    # For mse / binomial just slice the end off...
-    pred = pre_pred[:, :, :, 0]
+        sequences=[shuff_inpt, vinp],
+        outputs_info=[init_pred, init_hidden])
+    (pred, v_h1) = r
     theano.printing.Print("pred.shape")(pred.shape)
-    theano.printing.Print("v_h1.shape")(v_h1.shape)
+    pred = pred.dimshuffle(1, 0, 'x')
+    shp = pred.shape
+    theano.printing.Print("pred.shape")(pred.shape)
+    pred = pred.reshape((minibatch_size, shp[0] // minibatch_size,
+                         shp[1], shp[2]))
+    theano.printing.Print("pred.shape")(pred.shape)
+    pred = pred.dimshuffle(1, 0, 2, 3)
+    theano.printing.Print("pred.shape")(pred.shape)
+    pred = pred[:, :, :, 0]
+    theano.printing.Print("pred.shape")(pred.shape)
+    theano.printing.Print("target.shape")(target.shape)
     # binomial
     #pred = sigmoid(pre_pred.reshape((shp[0], shp[1], -1)))
     #cost = target * tensor.log(pred) + (n_bins - target) * tensor.log(1 - pred)
     # MSE
     cost = (pred - target) ** 2
-    theano.printing.Print("pred.shape")(pred.shape)
-    theano.printing.Print("target.shape")(target.shape)
 
     cost = cost * mask.dimshuffle(0, 1, 'x')
     # sum over sequence length and features, mean over minibatch
