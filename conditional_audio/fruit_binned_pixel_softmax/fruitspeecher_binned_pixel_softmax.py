@@ -12,7 +12,7 @@ from kdllib import make_weights, make_biases, relu, run_loop
 from kdllib import as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import soundsc, categorical_crossentropy
-from kdllib import sample_softmax, softmax
+from kdllib import sample_softmax, softmax, logsumexp
 
 
 
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     minibatch_size = 1
     n_epochs = 200  # Used way at the bottom in the training loop!
     checkpoint_every_n = 10
-    cut_len = 41  # Used way at the bottom in the training loop!
+    cut_len = 8  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
     train_itr = list_iterator([X, y], minibatch_size, axis=1,
@@ -514,13 +514,18 @@ if __name__ == "__main__":
     cost = cost.reshape((-1, cost.shape[2]))
     theano.printing.Print("cost.shape")(cost.shape)
     cost = cost.sum(axis=0).mean()
+    """
+    # optimize sum of probabilities rather than product?
+    cost = logsumexp(cost, axis=0)
+    cost = logsumexp(cost, axis=0) / minibatch_size
+    """
 
     l2_penalty = 0
     for p in list(set(params) - set(biases)):
         l2_penalty += (p ** 2).sum()
 
-    cost = cost + 1E-3 * l2_penalty
-    grads = tensor.grad(cost, params)
+    reg_cost = cost + 1E-3 * l2_penalty
+    grads = tensor.grad(reg_cost, params)
     grads = gradient_clipping(grads, 10.)
 
     learning_rate = 1E-4

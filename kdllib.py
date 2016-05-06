@@ -34,6 +34,7 @@ except ImportError:
 import threading
 import theano
 import theano.tensor as tensor
+from theano.tensor import nnet
 from theano.tensor.nnet.abstract_conv import conv2d_grad_wrt_inputs
 # Doesn't support binomial with n > 1??
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
@@ -2993,20 +2994,46 @@ def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
                          for out_dim in out_dims])
 
 
+def conv2d(input, filters, biases=None, border_mode=0, stride=(1, 1)):
+    """
+    Light wrapper around conv2d - optionally handle biases
+    """
+    r = nnet.conv2d(
+            input=input,
+            filters=filters,
+            border_mode=border_mode,
+            subsample=stride,
+            filter_flip=True)
+    if biases is None:
+        return r
+    else:
+        return r + biases.dimshuffle('x', 0, 'x', 'x')
+
+
 def unpool(input, pool_size=(1, 1)):
+    """
+    Repeat unpooling
+    """
     return input.repeat(pool_size[0], axis=2).repeat(pool_size[1], axis=3)
 
 
-def conv2d_transpose(input, filters, border_mode=0, stride=(1, 1)):
+def conv2d_transpose(input, filters, biases=None, border_mode=0, stride=(1, 1)):
+    """
+    Light wrapper around conv2d_transpose
+    """
     # swap to in dim out dim to make life easier
     filters = filters.transpose(1, 0, 2, 3)
-    return conv2d_grad_wrt_inputs(
+    r = conv2d_grad_wrt_inputs(
             output_grad=input,
             filters=filters,
             input_shape=(None, None, input.shape[2], input.shape[3]),
             border_mode=border_mode,
             subsample=stride,
             filter_flip=True)
+    if biases is None:
+        return r
+    else:
+        return r + biases.dimshuffle('x', 0, 'x', 'x')
 
 
 def t_conv_out_size(input_size, filter_size, stride, pad):
