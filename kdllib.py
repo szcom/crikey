@@ -1837,6 +1837,42 @@ def apply_lpc_softmax_preproc(X, fs=8000):
     return X, _apply, _re_sub
 
 
+def fetch_binarized_mnist():
+    # public version
+    url = 'https://github.com/mgermain/MADE/releases/download/ICML2015/'
+    url += 'binarized_mnist.npz'
+    partial_path = get_resource_dir("binarized_mnist")
+    fname = "binarized_mnist.npz"
+    full_path = os.path.join(partial_path, fname)
+    if not os.path.exists(full_path):
+        download(url, full_path)
+    d = np.load(full_path)
+    train = d["train_data"]
+    valid = d["valid_data"]
+    test = d["test_data"]
+    all_ = np.concatenate((train, valid, test), axis=0)
+    train_indices = np.arange(train.shape[0])
+    valid_indices = train.shape[0] + np.arange(valid.shape[0])
+    test_indices = train.shape[0] + valid.shape[0] + np.arange(test.shape[0])
+    t = {}
+    t["data"] = all_.reshape((-1, 28, 28))
+    t["train_indices"] = train_indices
+    t["valid_indices"] = valid_indices
+    t["test_indices"] = test_indices
+    """
+    # personal version
+    url = "https://dl.dropboxusercontent.com/u/15378192/binarized_mnist_%s.npy"
+    fname = "binarized_mnist_%s.npy"
+    for s in ["train", "valid", "test"]:
+        full_path = os.path.join(partial_path, fname % s)
+        if not os.path.exists(partial_path):
+            os.makedirs(partial_path)
+        if not os.path.exists(full_path):
+            download(url % s, full_path, progress_update_percentage=1)
+    """
+    return t
+
+
 def fetch_nottingham():
     midiread, midiwrite = midiwrap()
     url = "http://www.iro.umontreal.ca/~lisa/deep/data/Nottingham.zip"
@@ -1860,6 +1896,7 @@ def fetch_nottingham():
             data = midiread(p, key_range, dt).piano_roll.astype(
                 theano.config.floatX)
             all_data.append(data)
+    raise ValueError("Fix to return dictionary like the rest of the fetch_")
     return key_range, dt, all_data
 
 
@@ -3167,6 +3204,29 @@ def theano_one_hot(t, n_classes=None):
     return tensor.eq(ranges, tensor.shape_padright(t, 1))
 
 
+def binary_crossentropy(predicted_values, true_values):
+    """
+    Bernoulli negative log likelihood of predicted compared to binary
+    true_values
+
+    Parameters
+    ----------
+    predicted_values : tensor, shape 2D or 3D
+        The predicted values out of some layer, normally a sigmoid_layer
+
+    true_values : tensor, shape 2D or 3D
+        The ground truth values. Mush have same shape as predicted_values
+
+    Returns
+    -------
+    binary_crossentropy : tensor, shape predicted_values.shape[1:]
+        The cost per sample, or per sample per step if 3D
+
+    """
+    return (-true_values * tensor.log(predicted_values) - (
+        1 - true_values) * tensor.log(1 - predicted_values)).sum(axis=-1)
+
+
 def categorical_crossentropy(predicted_values, true_values, eps=0.):
     """
     Multinomial negative log likelihood of predicted compared to one hot
@@ -3886,7 +3946,8 @@ def implot(arr, title="", cmap="gray", save_name=None):
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
              checkpoint_delay=10, checkpoint_every_n=10,
-             monitor_frequency=1000, skip_minimums=False):
+             monitor_frequency=1000, skip_minimums=False,
+             skip_intermediates=False, skip_most_recents=False):
     """
     loop function should return a list of costs
     """
@@ -4000,7 +4061,7 @@ def run_loop(loop_function, train_function, train_itr,
                     train_costs[train_mb_count] = np.mean(partial_train_costs)
                     train_mb_count += 1
                     draw = random_state.rand()
-                    if draw < monitor_prob:
+                    if draw < monitor_prob and not skip_intermediates:
                         print(" ")
                         print("starting train mb %i" % train_mb_count)
                         print("current epoch mean cost %f" % np.mean(train_costs))
@@ -4022,7 +4083,7 @@ def run_loop(loop_function, train_function, train_itr,
                         valid_costs[valid_mb_count] = np.mean(partial_valid_costs)
                         valid_mb_count += 1
                         draw = random_state.rand()
-                        if draw < monitor_prob:
+                        if draw < monitor_prob and not skip_intermediates:
                             print(" ")
                             print("valid mb %i" % valid_mb_count)
                             print("current validation mean cost %f" % np.mean(
@@ -4152,9 +4213,12 @@ def run_loop(loop_function, train_function, train_itr,
                 checkpoint_stop = time.time()
                 joint_stop = time.time()
 
-                # Always save latest
-                results_save_path = "%s_most_recent_results.html" % ident
-                thw.send((results_save_path, results_dict))
+                if skip_most_recents:
+                    pass
+                else:
+                    # Save latest
+                    results_save_path = "%s_most_recent_results.html" % ident
+                    thw.send((results_save_path, results_dict))
 
                 # Will show up next go around
                 checkpoint_time_delta = checkpoint_stop - checkpoint_start

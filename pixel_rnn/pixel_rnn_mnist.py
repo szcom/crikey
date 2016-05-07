@@ -8,7 +8,7 @@ import sys
 from kdllib import load_checkpoint, conv2d, conv2d_transpose
 from kdllib import make_weights, make_biases
 from kdllib import make_conv_weights
-from kdllib import fetch_fruitspeech_spectrogram, list_iterator
+from kdllib import list_iterator
 from kdllib import fetch_binarized_mnist
 from kdllib import theano_one_hot
 from kdllib import softmax, tanh, logsumexp, sigmoid
@@ -20,7 +20,6 @@ from kdllib import run_loop
 if __name__ == "__main__":
     import argparse
 
-    #speech = fetch_fruitspeech_spectrogram()
     mnist = fetch_binarized_mnist()
     X = mnist["data"]
     train_indices = mnist["train_indices"]
