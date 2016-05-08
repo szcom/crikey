@@ -1531,8 +1531,19 @@ class list_iterator(base_iterator):
         cs = self._slice_without_masks(ind)
         if self.axis == 0:
             ms = [np.ones_like(c[:, 0]) for c in cs]
+            raise ValueError("NYI - see axis=0 case for ideas")
+            sliced_c = []
+            for n, c in enumerate(self.list_of_containers):
+                slc = c[ind]
+                for ii, si in enumerate(slc):
+                    ms[n][ii, len(si):] = 0.
         elif self.axis == 1:
             ms = [np.ones_like(c[:, :, 0]) for c in cs]
+            sliced_c = []
+            for n, c in enumerate(self.list_of_containers):
+                slc = c[ind]
+                for ii, si in enumerate(slc):
+                    ms[n][len(si):, ii] = 0.
         assert len(cs) == len(ms)
         return [i for sublist in list(zip(cs, ms)) for i in sublist]
 
@@ -1968,6 +1979,74 @@ def fetch_fruitspeech_spectrogram():
 
 
 def fetch_fruitspeech():
+    n_bins = 258
+    fs, d, wav_names = fetch_sample_speech_fruit()
+    def matcher(name):
+        return name.split("/")[1]
+
+    classes = [matcher(wav_name) for wav_name in wav_names]
+    all_chars = [c for c in sorted(list(set("".join(classes))))]
+    char2code = {v: k for k, v in enumerate(all_chars)}
+    vocabulary_size = len(char2code.keys())
+    y = []
+    for n, cl in enumerate(classes):
+        y.append(tokenize_ind(cl, char2code))
+
+    X = d
+    X_max = np.max([np.max(Xi) for Xi in X]).astype("float32")
+    X_min = np.min([np.min(Xi) for Xi in X]).astype("float32")
+
+    def scale(x):
+        x = (x - X_min) / (X_max - X_min)
+        return x
+
+    def unscale(x):
+        x = x * (X_max - X_min) + X_min
+        return x
+
+    # Extra n because bin is reserved kwd in Python
+    #bins = np.linspace(0, 1, n_bins)
+    # 9 is 10 - 1, 10 ** 1
+    bins = (np.logspace(0, 1, n_bins // 2) - 1) / 9
+    bins2 = bins / 2. + .5
+    bins = .5 - bins[::-1] / 2.
+    #want 256 bins - end up making a slightly larger bin above .5 (0 in -1, 1)
+    bins = np.concatenate((bins, bins2[2:]))
+    def binn(x):
+        shp = x.shape
+        return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
+
+    def unbin(x):
+        # use middle instead of left edge?
+        return np.array([bins[xi] for xi in x]).astype("float32")
+
+    X = [scale(Xi) for Xi in X]
+    X = [binn(Xi) for Xi in X]
+
+    def _re(x):
+        X_ub = unbin(x)
+        X_r = unscale(X_ub)
+        return X_r
+
+    """
+    for n, Xi in enumerate(X[::8]):
+        di = _re(Xi)
+        wavfile.write("t_%i.wav" % n, fs, soundsc(di))
+
+    raise ValueError()
+    """
+
+    speech = {}
+    speech["vocabulary_size"] = vocabulary_size
+    speech["vocabulary"] = char2code
+    speech["sample_rate"] = fs
+    speech["data"] = X
+    speech["target"] = y
+    speech["reconstruct"] = _re
+    return speech
+
+
+def fetch_fruitspeech_spectral():
     fs, d, wav_names = fetch_sample_speech_fruit()
     def matcher(name):
         return name.split("/")[1]
@@ -3105,23 +3184,38 @@ def t_conv_out_size(input_size, filter_size, stride, pad):
     return output_size
 
 
-def gru_weights(input_dim, hidden_dim, random_state):
+def gru_weights(input_dim, hidden_dim, forward_init="normal", hidden_init="normal", random_state=None):
+    if random_state is None:
+        raise ValueError("Must pass random_state!")
     shape = (input_dim, hidden_dim)
-    W = np.hstack([np_normal(shape, random_state),
-                   np_normal(shape, random_state),
-                   np_normal(shape, random_state)])
+    if forward_init == "normal":
+        W = np.hstack([np_normal(shape, random_state),
+                       np_normal(shape, random_state),
+                       np_normal(shape, random_state)])
+    elif forward_init == "fan":
+        W = np.hstack([np_tanh_fan_normal(shape, random_state),
+                       np_tanh_fan_normal(shape, random_state),
+                       np_tanh_fan_normal(shape, random_state)])
     b = np_zeros((3 * shape[1],))
-    Wur = np.hstack([np_normal((shape[1], shape[1]), random_state),
-                     np_normal((shape[1], shape[1]), random_state), ])
-    U = np_normal((shape[1], shape[1]), random_state)
+
+    if hidden_init == "normal":
+        Wur = np.hstack([np_normal((shape[1], shape[1]), random_state),
+                         np_normal((shape[1], shape[1]), random_state), ])
+        U = np_normal((shape[1], shape[1]), random_state)
+    elif hidden_init == "ortho":
+        Wur = np.hstack([np_ortho((shape[1], shape[1]), random_state),
+                         np_ortho((shape[1], shape[1]), random_state), ])
+        U = np_ortho((shape[1], shape[1]), random_state)
     return W, b, Wur, U
 
 
 class GRU(object):
-    def __init__(self, input_dim, hidden_dim, random_state):
+    def __init__(self, input_dim, hidden_dim, random_state=None, hidden_init="ortho"):
+        if random_state is None:
+            raise ValueError("Must pass random_state")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        W, b, Wur, U = gru_weights(input_dim, hidden_dim, random_state)
+        W, b, Wur, U = gru_weights(input_dim, hidden_dim, hidden_init=hidden_init, random_state=random_state)
         self.Wur = as_shared(Wur)
         self.U = as_shared(U)
         self.shape = (input_dim, hidden_dim)
@@ -3144,10 +3238,12 @@ class GRU(object):
 
 
 class GRUFork(object):
-    def __init__(self, input_dim, hidden_dim, random_state):
+    def __init__(self, input_dim, hidden_dim, random_state=None, forward_init="fan"):
+        if random_state is None:
+            raise ValueError("Must pass random_state")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        W, b, Wur, U = gru_weights(input_dim, hidden_dim, random_state)
+        W, b, Wur, U = gru_weights(input_dim, hidden_dim, forward_init=forward_init, random_state=random_state)
         self.W = as_shared(W)
         self.b = as_shared(b)
         self.shape = (input_dim, hidden_dim)
