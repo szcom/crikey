@@ -1548,6 +1548,105 @@ class list_iterator(base_iterator):
         return [i for sublist in list(zip(cs, ms)) for i in sublist]
 
 
+class audio_file_iterator(object):
+    def __init__(self, file_glob, minibatch_size, start_index=0,
+                 stop_index=np.inf, make_mask=True, preprocess=None,
+                 preprocess_kwargs={}):
+        """
+        Supports regular int, negative indexing, or float for setting
+        stop_index
+        """
+        self.minibatch_size = minibatch_size
+        self.file_list = glob.glob(file_glob)
+        if len(self.file_list) == 0:
+            raise ValueError("Invalid file glob, no files found!")
+        self.make_mask = make_mask
+        ext = self.file_list[0].split(".")[-1]
+        if ext == "flac":
+            import scikits.audiolab
+            def _read(fpath):
+                # d in -1, 1
+                d, fs, enc = scikits.audiolab.flacread(fpath)
+                return d
+        else:
+            raise ValueError("Unhandled extension %s" % ext)
+        self._read_file = _read
+        if preprocess is None:
+            self.preprocess_function = lambda x: x[:, None]
+        elif preprocess == "quantize_window":
+            # reslice to 2D in sets of 128, 4
+            n_frame = 4
+            n_bins = 256
+            if "n_frame" in preprocess_kwargs.keys():
+                n_frame = preprocess_kwargs["n_frame"]
+
+            if "n_bins" in preprocess_kwargs.keys():
+                n_bins = preprocess_kwargs["n_bins"]
+            def p(x):
+                # apply_ functions meant to operate on lists of sequences
+                return apply_quantize_window_preproc([x], n_bins, n_frame,
+                                                     mn=-1, mx=1)[0].astype("float32")
+            self.preprocess_function = p
+        elif preprocess == "quantize":
+            n_bins = 256
+            if "n_bins" in preprocess_kwargs.keys():
+                n_bins = preprocess_kwargs["n_bins"]
+            def p(x):
+                # apply_ functions meant to operate on lists of sequences
+                return apply_quantize_preproc([x], n_bins,
+                                              mn=-1, mx=1)[0][:, None].astype("float32")
+            self.preprocess_function = p
+
+
+        if stop_index >= 1:
+            self.stop_index = min(stop_index, len(self.file_list))
+        elif stop_index > 0:
+            # percentage
+            self.stop_index = int(stop_index * len(self.file_list))
+        elif stop_index < 0:
+            # negative index - must be int!
+            self.stop_index = len(self.file_list) + int(stop_index)
+
+        self.start_index = start_index
+        if start_index < 0:
+            # negative indexing
+            self.start_index = len(self.file_list) + start_index
+        elif start_index < 1:
+            # float
+            self.start_index = int(start_index * len(self.file_list))
+        else:
+            # regular
+            self.start_index = start_index
+        if self.start_index >= self.stop_index:
+            ss = "Invalid indexes - stop "
+            ss += "%s <= start %s !" % (stop_index, start_index)
+            raise ValueError(ss)
+        self._current_index = start_index
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        return self.__next__()
+
+    def __next__(self):
+        s = self._current_index
+        e = self._current_index + self.minibatch_size
+        if e > self.stop_index:
+            raise StopIteration("End of audio file iterator reached!")
+        files_to_get = self.file_list[s:e]
+        data = [self._read_file(fp) for fp in files_to_get]
+        data = [self.preprocess_function(d) for d in data]
+
+        li = list_iterator([data], self.minibatch_size, axis=1, start_index=0,
+                           stop_index=len(data), make_mask=self.make_mask)
+        res = next(li)
+        return res
+
+    def reset(self):
+        self._current_index = self.start_index
+
+
 def get_dataset_dir(dataset_name):
     """ Get dataset directory path """
     return os.sep.join(os.path.realpath(__file__).split
@@ -1574,6 +1673,49 @@ def tokenize_ind(phrase, vocabulary):
     phrase = np.array(phrase, dtype='int32').ravel()
     phrase = dense_to_one_hot(phrase, vocabulary_size)
     return phrase
+
+
+def apply_quantize_preproc(X, n_bins=256, mn=-32768, mx=32768):
+    def scale(x):
+        x = (x - mn) / (mx - mn)
+        return x
+
+    # Extra n because bin is reserved kwd in Python
+    bins = np.linspace(0, 1, n_bins)
+    def binn(x):
+        shp = x.shape
+        return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
+    X = [scale(Xi) for Xi in X]
+    X = [binn(Xi) for Xi in X]
+    return X
+
+
+def apply_quantize_window_preproc(X, n_bins=256, n_frame=4, mn=-32768, mx=32768):
+    def scale(x):
+        x = (x - mn) / (mx - mn)
+        return x
+
+    # Extra n because bin is reserved kwd in Python
+    bins = np.linspace(0, 1, n_bins)
+    def binn(x):
+        shp = x.shape
+        return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
+    X = [scale(Xi) for Xi in X]
+    X = [binn(Xi) for Xi in X]
+
+    def _s(x):
+        xi = x[:len(x) - len(x) % n_frame]
+        # chunk it
+        xi = xi.reshape((-1, n_frame))
+        #xi = overlap(xi, 4, 1)
+        return xi
+
+    X_windows = []
+    for x in X:
+        xw = _s(x)
+        X_windows.append(xw)
+    X = X_windows
+    return X
 
 
 def apply_stft_preproc(X, n_fft=128, n_step_frac=4):
@@ -1979,7 +2121,10 @@ def fetch_fruitspeech_spectrogram():
 
 
 def fetch_fruitspeech():
-    n_bins = 258
+    #258 to get 256 in fancy log
+    #n_bins = 258
+    n_bins = 256
+
     fs, d, wav_names = fetch_sample_speech_fruit()
     def matcher(name):
         return name.split("/")[1]
@@ -1993,6 +2138,8 @@ def fetch_fruitspeech():
         y.append(tokenize_ind(cl, char2code))
 
     X = d
+    # DC center
+    X = [di - di.mean() for di in d]
     X_max = np.max([np.max(Xi) for Xi in X]).astype("float32")
     X_min = np.min([np.min(Xi) for Xi in X]).astype("float32")
 
@@ -2007,11 +2154,14 @@ def fetch_fruitspeech():
     # Extra n because bin is reserved kwd in Python
     #bins = np.linspace(0, 1, n_bins)
     # 9 is 10 - 1, 10 ** 1
+    """
     bins = (np.logspace(0, 1, n_bins // 2) - 1) / 9
     bins2 = bins / 2. + .5
     bins = .5 - bins[::-1] / 2.
     #want 256 bins - end up making a slightly larger bin above .5 (0 in -1, 1)
     bins = np.concatenate((bins, bins2[2:]))
+    """
+    bins = np.linspace(0, 1, n_bins)
     def binn(x):
         shp = x.shape
         return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
@@ -3096,6 +3246,16 @@ def make_weights(in_dim, out_dims, random_state, init="normal",
                              for out_dim in out_dims])
 
 
+def embedding(index_array, embedding_weights):
+    ii = tensor.cast(index_array, "int32")
+    output_shape = [ii.shape[i] for i in range(ii.ndim - 1)] + [embedding_weights.shape[1]]
+    theano.printing.Print("index_array.shape")(index_array.shape)
+    theano.printing.Print("embedding_weights.shape")(embedding_weights.shape)
+    e = embedding_weights[ii.flatten()].reshape(output_shape)
+    theano.printing.Print("e.shape")(e.shape)
+    return e
+
+
 def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
     """
     Will return as many things as are in the list of out_dims
@@ -3279,6 +3439,14 @@ def softmax(X):
     e_X = tensor.exp(X - X.max(axis=dim - 1, keepdims=True))
     out = e_X / e_X.sum(axis=dim - 1, keepdims=True)
     return out
+
+
+def elu(x, alpha=1):
+    """
+    Compute the element-wise exponential linear activation function.
+    From theano 0.0.8 - here for backwards compat
+    """
+    return tensor.switch(x > 0, x, alpha * (tensor.exp(x) - 1))
 
 
 def relu(x):
@@ -4041,9 +4209,11 @@ def implot(arr, title="", cmap="gray", save_name=None):
 
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
-             checkpoint_delay=10, checkpoint_every_n=10,
+             checkpoint_delay=10, checkpoint_every_n_epochs=1,
+             checkpoint_every_n_updates=np.inf,
+             checkpoint_every_n_seconds=np.inf,
              monitor_frequency=1000, skip_minimums=False,
-             skip_intermediates=False, skip_most_recents=False):
+             skip_intermediates=True, skip_most_recents=False):
     """
     loop function should return a list of costs
     """
@@ -4135,6 +4305,7 @@ def run_loop(loop_function, train_function, train_itr,
     best_train_checkpoint_epoch = 0
     # If there are more than 1M minibatches per epoch this will break!
     # Not reallocating buffer greatly helps fast training models though
+    # Also we have bigger problems if there are 1M minibatches per epoch...
     train_costs = [0.] * 1000000
     valid_costs = [0.] * 1000000
     try:
@@ -4149,19 +4320,55 @@ def run_loop(loop_function, train_function, train_itr,
             results_dict = {k: v for k, v in checkpoint_dict.items()
                             if k not in ignore_keys}
             this_results_dict = results_dict
-            results_save_path = "%s_intermediate_results.html" % ident
             try:
                 train_start = time.time()
+                last_time_checkpoint = train_start
                 while True:
                     partial_train_costs = _loop(train_function, train_itr)
                     train_costs[train_mb_count] = np.mean(partial_train_costs)
                     train_mb_count += 1
+                    if (train_mb_count % checkpoint_every_n_updates) == 0:
+                        checkpoint_save_path = "%s_model_update_checkpoint_%i.pkl" % (ident, train_mb_count)
+                        weights_save_path = "%s_model_update_weights_%i.npz" % (ident, train_mb_count)
+                        results_save_path = "%s_model_update_results_%i.html" % (ident, train_mb_count)
+                        # Use pickle to preserve relationships between keys
+                        # while still copying buffers
+                        copy_pickle = pickle.dumps(checkpoint_dict)
+                        copy_dict = pickle.loads(copy_pickle)
+                        tcw.send((checkpoint_save_path, copy_dict))
+                        tww.send((weights_save_path, copy_dict))
+                        print(" ")
+                        print("update checkpoint after train mb %i" % train_mb_count)
+                        print("current mean cost %f" % np.mean(partial_train_costs))
+                        print(" ")
+                        this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
+                        thw.send((results_save_path, this_results_dict))
+                    elif (time.time() - last_time_checkpoint) >= checkpoint_every_n_seconds:
+                        time_diff = time.time() - last_time_checkpoint
+                        last_time_checkpoint = time.time()
+                        checkpoint_save_path = "%s_model_time_checkpoint_%i.pkl" % (ident, int(time_diff))
+                        weights_save_path = "%s_model_time_weights_%i.npz" % (ident, int(time_diff))
+                        results_save_path = "%s_model_time_results_%i.html" % (ident, int(time_diff))
+                        # Use pickle to preserve relationships between keys
+                        # while still copying buffers
+                        copy_pickle = pickle.dumps(checkpoint_dict)
+                        copy_dict = pickle.loads(copy_pickle)
+                        tcw.send((checkpoint_save_path, copy_dict))
+                        tww.send((weights_save_path, copy_dict))
+                        print(" ")
+                        print("time checkpoint after train mb %i" % train_mb_count)
+                        print("current mean cost %f" % np.mean(partial_train_costs))
+                        print(" ")
+                        this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
+                        thw.send((results_save_path, this_results_dict))
+
                     draw = random_state.rand()
                     if draw < monitor_prob and not skip_intermediates:
                         print(" ")
                         print("starting train mb %i" % train_mb_count)
-                        print("current epoch mean cost %f" % np.mean(train_costs))
+                        print("current mean cost %f" % np.mean(partial_train_costs))
                         print(" ")
+                        results_save_path = "%s_intermediate_results.html" % ident
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         thw.send((results_save_path, this_results_dict))
                     else:
@@ -4185,6 +4392,7 @@ def run_loop(loop_function, train_function, train_itr,
                             print("current validation mean cost %f" % np.mean(
                                 valid_costs))
                             print(" ")
+                            results_save_path = "%s_intermediate_results.html" % ident
                             this_results_dict["this_epoch_valid_auto"] = valid_costs[:valid_mb_count]
                             thw.send((results_save_path, this_results_dict))
                         else:
@@ -4292,7 +4500,7 @@ def run_loop(loop_function, train_function, train_itr,
                     pass
                     # Don't skip force checkpoints after default delay
                     # Printing already happens above
-                elif((e % checkpoint_every_n) == 0) or (e == (n_epochs - 1)):
+                elif((e % checkpoint_every_n_epochs) == 0) or (e == (n_epochs - 1)):
                     print("checkpointing force...")
                     checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                     weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
