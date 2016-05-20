@@ -3247,9 +3247,20 @@ def make_weights(in_dim, out_dims, random_state, init="normal",
 
 
 def embedding(index_array, embedding_weights):
+    """
+    expects an index array of shape (N, M, 1) or (M, 1)
+    outputs an array of shape (N, M, embedding_weights.shape[1])
+    or (M, embedding_weights.shape[1])
+    """
     ii = tensor.cast(index_array, "int32")
-    output_shape = [ii.shape[i] for i in range(ii.ndim - 1)] + [embedding_weights.shape[1]]
-    theano.printing.Print("index_array.shape")(index_array.shape)
+    if ii.ndim == 3:
+        # assuming middle dimension is minibatch
+        output_shape = [ii.shape[0], ii.shape[1], embedding_weights.shape[1]]
+    elif ii.ndim == 2:
+        output_shape = [ii.shape[0], embedding_weights.shape[1]]
+    else:
+        raise ValueError("Unknown input dimension!")
+    theano.printing.Print("index_array.shape")(ii.shape)
     theano.printing.Print("embedding_weights.shape")(embedding_weights.shape)
     e = embedding_weights[ii.flatten()].reshape(output_shape)
     theano.printing.Print("e.shape")(e.shape)

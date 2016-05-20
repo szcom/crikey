@@ -239,8 +239,10 @@ if __name__ == "__main__":
 
 
     init_x = tensor.fmatrix()
-    init_x.tag.test_value = np_zeros((minibatch_size, input_dim)).astype(theano.config.floatX)
-    init_embed1 = embedding(inpt, embed1_w)
+    init_x.tag.test_value = np_zeros((minibatch_size, 1)).astype(theano.config.floatX)
+    init_embed1 = embedding(init_x, embed1_w)
+    theano.printing.Print("init_x.shape")(init_x.shape)
+    theano.printing.Print("init_embed1.shape")(init_embed1.shape)
 
     srng = RandomStreams(1999)
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1):
