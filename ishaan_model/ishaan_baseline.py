@@ -7,10 +7,11 @@ from scipy.io import wavfile
 import os
 import sys
 from kdllib import audio_file_iterator
+from kdllib import numpy_one_hot, apply_quantize_preproc
 from kdllib import embedding
 from kdllib import load_checkpoint, theano_one_hot, concatenate
 from kdllib import fetch_fruitspeech, list_iterator
-from kdllib import np_zeros, GRU, GRUFork, dense_to_one_hot
+from kdllib import np_zeros, GRU, GRUFork
 from kdllib import make_weights, make_biases, relu, run_loop
 from kdllib import as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
@@ -22,12 +23,7 @@ from kdllib import relu, softmax, sample_softmax
 if __name__ == "__main__":
     import argparse
 
-    speech = fetch_fruitspeech()
-    X = speech["data"]
-    fs = speech["sample_rate"]
-    reconstruct = speech["reconstruct"]
-    X = np.array([x.astype(theano.config.floatX) for x in X])
-
+    fs = 16000
     minibatch_size = 128
     cut_len = 64
     n_epochs = 1000  # Used way at the bottom in the training loop!
@@ -84,13 +80,8 @@ if __name__ == "__main__":
                              " does not exist!")
         print(checkpoint_file)
         checkpoint_dict = load_checkpoint(checkpoint_file)
-        train_costs = checkpoint_dict["train_costs"]
-        valid_costs = checkpoint_dict["valid_costs"]
-        plt.plot(train_costs)
-        plt.plot(valid_costs)
-        plt.savefig("costs.png")
 
-        X_mb, X_mb_mask, y_mb, y_mb_mask = next(train_itr)
+        X_mb, X_mb_mask = next(train_itr)
         train_itr.reset()
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
@@ -103,7 +94,8 @@ if __name__ == "__main__":
         else:
             fixed_steps = args.sample_length
             completed = []
-            init_x = np.zeros_like(X_mb[0]) + int(n_bins // 2)
+            # 0 is in the middle
+            init_x = 127 + np_zeros((minibatch_size, input_dim)).astype(theano.config.floatX)
             for i in range(fixed_steps):
                 if i % 100 == 0:
                     print("Sampling step %i" % i)
@@ -111,22 +103,26 @@ if __name__ == "__main__":
                 rvals = sample_function(init_x, prev_h1, prev_h2,
                                         prev_h3)
                 sampled, h1_s, h2_s, h3_s = rvals
-                # remove cast later
-                sampled = sampled.astype("float32")
                 completed.append(sampled)
+
+                sampled_oh = numpy_one_hot(sampled.astype("int32"), input_dim)
+                sampled = sampled_oh.astype(theano.config.floatX)
                 # cheating sampling...
-                #init_x = X_mb[i]
+                #init_x = numpy_one_hot(X_mb[i].ravel().astype("int32"), input_dim).astype(theano.config.floatX)
+
                 init_x = sampled
                 prev_h1 = h1_s
                 prev_h2 = h2_s
                 prev_h3 = h3_s
             print("Completed sampling after %i steps" % fixed_steps)
-            completed = np.array(completed).transpose(1, 0, 2)
-            for i in range(len(completed)):
+            # mb, length
+            completed = np.array(completed)
+            from IPython import embed; embed()
+            # all samples would be range(len(completed))
+            for i in range(10):
                 ex = completed[i].ravel()
                 s = "gen_%i.wav" % (i)
-                ii = reconstruct(ex.astype("int32"))
-                wavfile.write(s, fs, soundsc(ii))
+                wavfile.write(s, fs, soundsc(ex))
         print("Sampling complete, exiting...")
         sys.exit()
     else:
@@ -204,7 +200,7 @@ if __name__ == "__main__":
     h3_to_outs, = make_weights(n_hid, [n_proj], random_state)
     b_to_outs, = make_biases([n_proj])
 
-    params += [h1_to_outs, h2_to_outs, h3_to_outs]
+    params += [h1_to_outs, h2_to_outs, h3_to_outs, b_to_outs]
     biases += [b_to_outs]
 
     pred_w, = make_weights(n_proj, [n_bins], random_state)
@@ -244,8 +240,9 @@ if __name__ == "__main__":
 
     init_x = tensor.fmatrix()
     init_x.tag.test_value = np_zeros((minibatch_size, input_dim)).astype(theano.config.floatX)
-    srng = RandomStreams(1999)
+    init_embed1 = embedding(inpt, embed1_w)
 
+    srng = RandomStreams(1999)
     def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1):
         xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
         xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1)
@@ -274,7 +271,7 @@ if __name__ == "__main__":
         return x_t, h1_t, h2_t, h3_t
 
     (sampled, h1_s, h2_s, h3_s) = sample_step(
-        init_x, init_h1, init_h2, init_h3)
+        init_embed1, init_h1, init_h2, init_h3)
     theano.printing.Print("sampled.shape")(sampled.shape)
 
     (h1, h2, h3), updates = theano.scan(

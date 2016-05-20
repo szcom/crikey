@@ -81,8 +81,8 @@ def soundsc(X, copy=True):
     """
     X = np.array(X, copy=copy)
     X = (X - X.min()) / (X.max() - X.min())
-    X = .9 * X
     X = 2 * X - 1
+    X = .9 * X
     X = X * 2 ** 15
     return X.astype('int16')
 
@@ -1653,7 +1653,7 @@ def get_dataset_dir(dataset_name):
                        (os.sep)[:-1] + [dataset_name])
 
 
-def dense_to_one_hot(labels_dense, n_classes=10):
+def numpy_one_hot(labels_dense, n_classes=10):
     """Convert class labels from scalars to one-hot vectors."""
     labels_shape = labels_dense.shape
     labels_dtype = labels_dense.dtype
@@ -1671,7 +1671,7 @@ def tokenize_ind(phrase, vocabulary):
     vocabulary_size = len(vocabulary.keys())
     phrase = [vocabulary[char_] for char_ in phrase]
     phrase = np.array(phrase, dtype='int32').ravel()
-    phrase = dense_to_one_hot(phrase, vocabulary_size)
+    phrase = numpy_one_hot(phrase, vocabulary_size)
     return phrase
 
 
@@ -2441,7 +2441,7 @@ def fetch_fruitspeech_nonpar():
         return m
 
     X = [_apply(Xi) for Xi in d]
-    X = [dense_to_one_hot(Xi, len(sub_clusters)) for Xi in X]
+    X = [numpy_one_hot(Xi, len(sub_clusters)) for Xi in X]
 
     """
     for n, Xi in enumerate(X[all_ind[0]::8]):
@@ -4344,7 +4344,7 @@ def run_loop(loop_function, train_function, train_itr,
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         thw.send((results_save_path, this_results_dict))
                     elif (time.time() - last_time_checkpoint) >= checkpoint_every_n_seconds:
-                        time_diff = time.time() - last_time_checkpoint
+                        time_diff = time.time() - train_start
                         last_time_checkpoint = time.time()
                         checkpoint_save_path = "%s_model_time_checkpoint_%i.pkl" % (ident, int(time_diff))
                         weights_save_path = "%s_model_time_weights_%i.npz" % (ident, int(time_diff))
@@ -4426,7 +4426,7 @@ def run_loop(loop_function, train_function, train_itr,
                 if np.isnan(mean_epoch_train_cost):
                     print("previous train costs %s" % overall_train_costs[-5:])
                     print("NaN detected in train cost, epoch %i" % e)
-                    break
+                    raise StopIteration("NaN detected in train")
                 overall_train_costs.append(mean_epoch_train_cost)
 
                 mean_epoch_valid_cost = np.mean(valid_costs)
@@ -4434,7 +4434,7 @@ def run_loop(loop_function, train_function, train_itr,
                 if np.isnan(mean_epoch_valid_cost):
                     print("previous valid costs %s" % overall_valid_costs[-5:])
                     print("NaN detected in valid cost, epoch %i" % e)
-                    break
+                    raise StopIteration("NaN detected in valid")
                 overall_valid_costs.append(mean_epoch_valid_cost)
 
                 if mean_epoch_train_cost < old_min_train_cost:
