@@ -4271,7 +4271,7 @@ class Igor(object):
         # Must refresh after reloading from pkl
         self.loop_function = loop_function
         self.train_function = train_function
-        self.train_itr = train
+        self.train_itr = train_itr
         self.valid_function = valid_function
         self.valid_itr = valid_itr
         self.n_epochs = n_epochs
@@ -4416,7 +4416,7 @@ def run_loop(loop_function, train_function, train_itr,
                 train_start = time.time()
                 last_time_checkpoint = train_start
                 while True:
-                    if train_mb_count <= skip_n_train_minibatches:
+                    if train_mb_count < skip_n_train_minibatches:
                         train_mb_count += 1
                         continue
                     partial_train_costs = _loop(train_function, train_itr)
