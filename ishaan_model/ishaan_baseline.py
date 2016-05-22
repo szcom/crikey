@@ -9,6 +9,7 @@ import sys
 from kdllib import audio_file_iterator
 from kdllib import numpy_one_hot, apply_quantize_preproc
 from kdllib import embedding
+from kdllib import Igor
 from kdllib import load_checkpoint, theano_one_hot, concatenate
 from kdllib import fetch_fruitspeech, list_iterator
 from kdllib import np_zeros, GRU, GRUFork
@@ -388,11 +389,15 @@ if __name__ == "__main__":
             prev_h2 = prev_h2[-1]
             prev_h3 = prev_h3[-1]
         partial_costs.append(current_cost)
+        print("")
         return partial_costs
 
-run_loop(_loop, train_function, train_itr, cost_function, valid_itr,
+i = Igor(_loop, train_function, train_itr, cost_function, valid_itr,
          n_epochs=n_epochs, checkpoint_dict=checkpoint_dict,
          checkpoint_every_n_updates=checkpoint_every_n_updates,
          checkpoint_every_n_seconds=checkpoint_every_n_seconds,
          checkpoint_every_n_epochs=checkpoint_every_n_epochs,
          skip_minimums=True)
+#i.refresh(_loop, train_function, train_itr, cost_function, valid_itr,
+#          n_epochs, checkpoint_dict)
+i.run()

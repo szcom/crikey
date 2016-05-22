@@ -1599,7 +1599,7 @@ class audio_file_iterator(object):
 
 
         if stop_index >= 1:
-            self.stop_index = min(stop_index, len(self.file_list))
+            self.stop_index = int(min(stop_index, len(self.file_list)))
         elif stop_index > 0:
             # percentage
             self.stop_index = int(stop_index * len(self.file_list))
@@ -1607,7 +1607,6 @@ class audio_file_iterator(object):
             # negative index - must be int!
             self.stop_index = len(self.file_list) + int(stop_index)
 
-        self.start_index = start_index
         if start_index < 0:
             # negative indexing
             self.start_index = len(self.file_list) + start_index
@@ -1616,12 +1615,12 @@ class audio_file_iterator(object):
             self.start_index = int(start_index * len(self.file_list))
         else:
             # regular
-            self.start_index = start_index
+            self.start_index = int(start_index)
         if self.start_index >= self.stop_index:
             ss = "Invalid indexes - stop "
-            ss += "%s <= start %s !" % (stop_index, start_index)
+            ss += "%s <= start %s !" % (self.stop_index, self.start_index)
             raise ValueError(ss)
-        self._current_index = start_index
+        self._current_index = self.start_index
 
     def __iter__(self):
         return self
@@ -1641,6 +1640,7 @@ class audio_file_iterator(object):
         li = list_iterator([data], self.minibatch_size, axis=1, start_index=0,
                            stop_index=len(data), make_mask=self.make_mask)
         res = next(li)
+        self._current_index = e
         return res
 
     def reset(self):
@@ -4218,15 +4218,94 @@ def implot(arr, title="", cmap="gray", save_name=None):
         plt.savefig(save_name)
 
 
+class Igor(object):
+    """
+    Runs the loop - thin wrapper for serializing
+
+    Named in reference to https://www.reddit.com/r/MachineLearning/comments/4kd1qp/good_code_to_learn_from/d3e2irr
+    """
+    def __init__(self, loop_function, train_function, train_itr,
+                 valid_function, valid_itr, n_epochs, checkpoint_dict,
+                 checkpoint_delay=10,
+                 checkpoint_every_n_epochs=1,
+                 checkpoint_every_n_updates=np.inf,
+                 checkpoint_every_n_seconds=np.inf,
+                 monitor_frequency=1000,
+                 skip_minimums=False,
+                 skip_intermediates=True,
+                 skip_most_recents=False):
+        self.loop_function = loop_function
+        self.train_function = train_function
+        self.train_itr = train_itr
+        self.valid_function = valid_function
+        self.valid_itr = valid_itr
+        self.n_epochs = n_epochs
+        self.checkpoint_dict = checkpoint_dict
+
+        # These parameters should be serialized
+        self.checkpoint_delay = checkpoint_delay
+        self.checkpoint_every_n_epochs = checkpoint_every_n_epochs
+        self.checkpoint_every_n_updates = checkpoint_every_n_updates
+        self.checkpoint_every_n_seconds = checkpoint_every_n_seconds
+        self.monitor_frequency = monitor_frequency
+        self.skip_minimums = skip_minimums
+        self.skip_intermediates = skip_intermediates
+        self.skip_most_recents = skip_most_recents
+
+        # tracker to ensure restarting at the correct minibatch
+        self.num_train_minibatches_run = -1
+
+    def __getstate__(self):
+        skiplist = [self.loop_function,
+                    self.train_function,
+                    self.train_itr,
+                    self.valid_function,
+                    self.valid_itr,
+                    self.n_epochs,
+                    self.checkpoint_dict]
+        return {k:v for k, v in self.__dict__.items() if v not in skiplist}
+
+    def refresh(self, loop_function, train_function, train_itr,
+                valid_function, valid_itr, n_epochs,
+                checkpoint_dict):
+        # Must refresh after reloading from pkl
+        self.loop_function = loop_function
+        self.train_function = train_function
+        self.train_itr = train
+        self.valid_function = valid_function
+        self.valid_itr = valid_itr
+        self.n_epochs = n_epochs
+        self.checkpoint_dict = checkpoint_dict
+
+    def run(self):
+        run_loop(self.loop_function, self.train_function, self.train_itr,
+                 self.valid_function, self.valid_itr, self.n_epochs,
+                 self.checkpoint_dict,
+                 self.checkpoint_delay,
+                 self.checkpoint_every_n_epochs,
+                 self.checkpoint_every_n_updates,
+                 self.checkpoint_every_n_seconds,
+                 self.monitor_frequency,
+                 self.skip_minimums,
+                 self.skip_intermediates,
+                 self.skip_most_recents,
+                 self.num_train_minibatches_run,
+                 self)
+
 def run_loop(loop_function, train_function, train_itr,
              valid_function, valid_itr, n_epochs, checkpoint_dict,
              checkpoint_delay=10, checkpoint_every_n_epochs=1,
              checkpoint_every_n_updates=np.inf,
              checkpoint_every_n_seconds=np.inf,
              monitor_frequency=1000, skip_minimums=False,
-             skip_intermediates=True, skip_most_recents=False):
+             skip_intermediates=True, skip_most_recents=False,
+             skip_n_train_minibatches=-1,
+             stateful_object=None):
     """
     loop function should return a list of costs
+    stateful_object allows to serialize and relaunch in middle of an epoch
+    for long training models
+    TODO: add serialization of kdllib.py and calling script with id tagged in name
     """
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
@@ -4306,6 +4385,7 @@ def run_loop(loop_function, train_function, train_itr,
 
         start_epoch = 0
 
+
     tcw = threaded_checkpoint_writer()
     tww = threaded_weights_writer()
     thw = threaded_html_writer()
@@ -4317,6 +4397,7 @@ def run_loop(loop_function, train_function, train_itr,
     # If there are more than 1M minibatches per epoch this will break!
     # Not reallocating buffer greatly helps fast training models though
     # Also we have bigger problems if there are 1M minibatches per epoch...
+    # This will get sliced down to the correct number of minibatches down below
     train_costs = [0.] * 1000000
     valid_costs = [0.] * 1000000
     try:
@@ -4335,8 +4416,16 @@ def run_loop(loop_function, train_function, train_itr,
                 train_start = time.time()
                 last_time_checkpoint = train_start
                 while True:
+                    if train_mb_count <= skip_n_train_minibatches:
+                        train_mb_count += 1
+                        continue
                     partial_train_costs = _loop(train_function, train_itr)
                     train_costs[train_mb_count] = np.mean(partial_train_costs)
+                    tc = train_costs[train_mb_count]
+                    if np.isnan(tc):
+                        print("NaN detected in train cost, update %i" % train_mb_count)
+                        raise StopIteration("NaN detected in train")
+
                     train_mb_count += 1
                     if (train_mb_count % checkpoint_every_n_updates) == 0:
                         checkpoint_save_path = "%s_model_update_checkpoint_%i.pkl" % (ident, train_mb_count)
@@ -4353,7 +4442,16 @@ def run_loop(loop_function, train_function, train_itr,
                         print("current mean cost %f" % np.mean(partial_train_costs))
                         print(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
+                        tmb = train_costs[:train_mb_count]
+                        running_train_mean = np.cumsum(tmb) / (np.arange(train_mb_count) + 1)
+                        # needs to be a list
+                        running_train_mean = list(running_train_mean)
+                        this_results_dict["this_epoch_train_mean_auto"] = running_train_mean
                         thw.send((results_save_path, this_results_dict))
+                        if stateful_object is not None:
+                            stateful_object.num_train_minibatches_run = train_mb_count
+                            object_save_path = "%s_model_update_object_%i.pkl" % (ident, train_mb_count)
+                            save_checkpoint(object_save_path, stateful_object)
                     elif (time.time() - last_time_checkpoint) >= checkpoint_every_n_seconds:
                         time_diff = time.time() - train_start
                         last_time_checkpoint = time.time()
@@ -4371,8 +4469,16 @@ def run_loop(loop_function, train_function, train_itr,
                         print("current mean cost %f" % np.mean(partial_train_costs))
                         print(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
+                        tmb = train_costs[:train_mb_count]
+                        running_train_mean = np.cumsum(tmb) / (np.arange(train_mb_count) + 1)
+                        # needs to be a list
+                        running_train_mean = list(running_train_mean)
+                        this_results_dict["this_epoch_train_mean_auto"] = running_train_mean
                         thw.send((results_save_path, this_results_dict))
-
+                        if stateful_object is not None:
+                            stateful_object.num_train_minibatches_run = train_mb_count
+                            object_save_path = "%s_model_time_object_%i.pkl" % (ident, train_mb_count)
+                            save_checkpoint(object_save_path, stateful_object)
                     draw = random_state.rand()
                     if draw < monitor_prob and not skip_intermediates:
                         print(" ")
@@ -4385,6 +4491,9 @@ def run_loop(loop_function, train_function, train_itr,
                     else:
                         print(".", end="")
             except StopIteration:
+                # Slice so that only valid data is in the minibatch
+                # this also assumes there is not a variable number
+                # of minibatches in an epoch!
                 train_stop = time.time()
                 train_costs = train_costs[:train_mb_count]
                 print(" ")
@@ -4395,6 +4504,10 @@ def run_loop(loop_function, train_function, train_itr,
                     while True:
                         partial_valid_costs = _loop(valid_function, valid_itr)
                         valid_costs[valid_mb_count] = np.mean(partial_valid_costs)
+                        vc = valid_costs[valid_mb_count]
+                        if np.isnan(vc):
+                            print("NaN detected in valid cost, minibatch %i" % valid_mb_count)
+                            raise StopIteration("NaN detected in valid")
                         valid_mb_count += 1
                         draw = random_state.rand()
                         if draw < monitor_prob and not skip_intermediates:
