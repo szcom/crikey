@@ -1550,7 +1550,8 @@ class list_iterator(base_iterator):
 
 class audio_file_iterator(object):
     def __init__(self, file_glob, minibatch_size, start_index=0,
-                 stop_index=np.inf, make_mask=True, preprocess=None,
+                 stop_index=np.inf, make_mask=True,
+                 randomize=True, preprocess=None,
                  preprocess_kwargs={}):
         """
         Supports regular int, negative indexing, or float for setting
@@ -1560,6 +1561,9 @@ class audio_file_iterator(object):
         self.file_list = glob.glob(file_glob)
         if len(self.file_list) == 0:
             raise ValueError("Invalid file glob, no files found!")
+        if randomize:
+            self.random_state = np.random.RandomState(2177)
+        self.random_state.shuffle(self.file_list)
         self.make_mask = make_mask
         ext = self.file_list[0].split(".")[-1]
         if ext == "flac":
@@ -4477,7 +4481,7 @@ def run_loop(loop_function, train_function, train_itr,
                         thw.send((results_save_path, this_results_dict))
                         if stateful_object is not None:
                             stateful_object.num_train_minibatches_run = train_mb_count
-                            object_save_path = "%s_model_time_object_%i.pkl" % (ident, train_mb_count)
+                            object_save_path = "%s_model_time_object_%i.pkl" % (ident, int(time_diff))
                             save_checkpoint(object_save_path, stateful_object)
                     draw = random_state.rand()
                     if draw < monitor_prob and not skip_intermediates:

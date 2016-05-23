@@ -96,7 +96,7 @@ if __name__ == "__main__":
             fixed_steps = args.sample_length
             completed = []
             # 0 is in the middle
-            init_x = 127 + np_zeros((minibatch_size, input_dim)).astype(theano.config.floatX)
+            init_x = 127 + np_zeros((minibatch_size, 1)).astype(theano.config.floatX)
             for i in range(fixed_steps):
                 if i % 100 == 0:
                     print("Sampling step %i" % i)
@@ -105,9 +105,7 @@ if __name__ == "__main__":
                                         prev_h3)
                 sampled, h1_s, h2_s, h3_s = rvals
                 completed.append(sampled)
-
-                sampled_oh = numpy_one_hot(sampled.astype("int32"), input_dim)
-                sampled = sampled_oh.astype(theano.config.floatX)
+                sampled = sampled.astype(theano.config.floatX)[:, None]
                 # cheating sampling...
                 #init_x = numpy_one_hot(X_mb[i].ravel().astype("int32"), input_dim).astype(theano.config.floatX)
 
@@ -118,12 +116,18 @@ if __name__ == "__main__":
             print("Completed sampling after %i steps" % fixed_steps)
             # mb, length
             completed = np.array(completed)
-            from IPython import embed; embed()
+            completed = completed.transpose(1, 0)
             # all samples would be range(len(completed))
             for i in range(10):
                 ex = completed[i].ravel()
                 s = "gen_%i.wav" % (i)
-                wavfile.write(s, fs, soundsc(ex))
+                ex = ex.astype("float32")
+                ex -= ex.min()
+                ex /= ex.max()
+                ex -= 0.5
+                ex *= 0.95
+                wavfile.write(s, fs, ex)
+                #wavfile.write(s, fs, soundsc(ex))
         print("Sampling complete, exiting...")
         sys.exit()
     else:
