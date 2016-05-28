@@ -8,7 +8,10 @@ import os
 import sys
 from kdllib import audio_file_iterator
 from kdllib import numpy_one_hot, apply_quantize_preproc
-from kdllib import embedding
+from kdllib import param, param_search
+from kdllib import LearnedHiddenInit
+from kdllib import Linear
+from kdllib import Embedding
 from kdllib import Igor
 from kdllib import load_checkpoint, theano_one_hot, concatenate
 from kdllib import fetch_fruitspeech, list_iterator
@@ -147,181 +150,51 @@ if __name__ == "__main__":
     init_h3_i = tensor.matrix("init_h3")
     init_h3_i.tag.test_value = np_zeros((minibatch_size, n_hid))
 
-    params = []
-    biases = []
+    init_h1, init_h2, init_h3 = LearnedHiddenInit(
+        [init_h1_i, init_h2_i, init_h3_i], 3 * [(minibatch_size, n_hid)])
 
-    embed1_w, = make_weights(input_dim, [n_embed,], random_state=random_state,
-                             scale=1.)
-    params += [embed1_w]
-
-    # learnable initial states seem to give ~.1 bit improvement!
-    init_h1_l, init_h2_l, init_h3_l = make_biases(3 * [n_hid])
-    params += [init_h1_l, init_h2_l, init_h3_l]
-    # Magnitude of these should probably not get l2 penalized
-    biases += [init_h1_l, init_h2_l, init_h3_l]
-
-    # Logic to swap to learned init if all zero, otherwise use learned
-    init_h1_l = tensor.alloc(init_h1_l, minibatch_size, n_hid)
-    init_h1 = theano.ifelse.ifelse(tensor.abs_(init_h1_i.sum()) < 1E-12,
-                                   init_h1_l, init_h1_i)
-    init_h2_l = tensor.alloc(init_h2_l, minibatch_size, n_hid)
-    init_h2 = theano.ifelse.ifelse(tensor.abs_(init_h2_i.sum()) < 1E-12,
-                                   init_h2_l, init_h2_i)
-    init_h3_l = tensor.alloc(init_h3_l, minibatch_size, n_hid)
-    init_h3 = theano.ifelse.ifelse(tensor.abs_(init_h3_i.sum()) < 1E-12,
-                                   init_h3_l, init_h3_i)
-
-    cell1 = GRU(input_dim, n_hid, random_state)
-    cell2 = GRU(n_hid, n_hid, random_state)
-    cell3 = GRU(n_hid, n_hid, random_state)
-
-    params += cell1.get_params()
-    params += cell2.get_params()
-    params += cell3.get_params()
-
-    inp_to_h1 = GRUFork(input_dim, n_hid, random_state)
-    inp_to_h2 = GRUFork(input_dim, n_hid, random_state)
-    inp_to_h3 = GRUFork(input_dim, n_hid, random_state)
-    h1_to_h2 = GRUFork(n_hid, n_hid, random_state)
-    h1_to_h3 = GRUFork(n_hid, n_hid, random_state)
-    h2_to_h3 = GRUFork(n_hid, n_hid, random_state)
-
-    params += inp_to_h1.get_params()
-    params += inp_to_h2.get_params()
-    params += inp_to_h3.get_params()
-    params += h1_to_h2.get_params()
-    params += h1_to_h3.get_params()
-    params += h2_to_h3.get_params()
-
-    biases += inp_to_h1.get_biases()
-    biases += inp_to_h2.get_biases()
-    biases += inp_to_h3.get_biases()
-    biases += h1_to_h2.get_biases()
-    biases += h1_to_h3.get_biases()
-    biases += h2_to_h3.get_biases()
-
-    h1_to_outs, = make_weights(n_hid, [n_proj], random_state)
-    h2_to_outs, = make_weights(n_hid, [n_proj], random_state)
-    h3_to_outs, = make_weights(n_hid, [n_proj], random_state)
-    b_to_outs, = make_biases([n_proj])
-
-    params += [h1_to_outs, h2_to_outs, h3_to_outs, b_to_outs]
-    biases += [b_to_outs]
-
-    pred_w, = make_weights(n_proj, [n_bins], random_state)
-    pred_b, = make_biases([n_bins])
-    params += [pred_w, pred_b]
-    biases += [pred_b]
-
-    # Done initializing
     inpt = X_sym[:-1]
     target = X_sym[1:]
     mask = X_mask_sym[:-1]
-    embed1 = embedding(inpt, embed1_w)
+    embed_dim = 256
+    embed1 = Embedding(inpt, 256, embed_dim, random_state)
+    in_h1, ingate_h1 = GRUFork([embed1], [embed_dim], n_hid, random_state)
 
-    inp_h1, inpgate_h1 = inp_to_h1.proj(embed1)
-    inp_h2, inpgate_h2 = inp_to_h2.proj(embed1)
-    inp_h3, inpgate_h3 = inp_to_h3.proj(embed1)
-
-    def step(xinp_h1_t, xgate_h1_t,
-             xinp_h2_t, xgate_h2_t,
-             xinp_h3_t, xgate_h3_t,
+    def step(in_h1_t, ingate_h1_t,
              h1_tm1, h2_tm1, h3_tm1):
-        h1_t = cell1.step(xinp_h1_t, xgate_h1_t,
-                          h1_tm1)
-        h1inp_h2, h1gate_h2 = h1_to_h2.proj(h1_t)
-        h1inp_h3, h1gate_h3 = h1_to_h3.proj(h1_t)
+        h1_t = GRU(in_h1_t, ingate_h1_t, h1_tm1, n_hid, n_hid, random_state)
+        h1_h2_t, h1gate_h2_t = GRUFork([h1_t], [n_hid], n_hid, random_state)
 
-        h2_t = cell2.step(xinp_h2_t + h1inp_h2,
-                          xgate_h2_t + h1gate_h2, h2_tm1)
+        h2_t = GRU(h1_h2_t, h1gate_h2_t, h2_tm1, n_hid, n_hid, random_state)
 
-        h2inp_h3, h2gate_h3 = h2_to_h3.proj(h2_t)
+        h2_h3_t, h2gate_h3_t = GRUFork([h2_t], [n_hid], n_hid, random_state)
 
-        h3_t = cell3.step(xinp_h3_t + h1inp_h3 + h2inp_h3,
-                          xgate_h3_t + h1gate_h3 + h2gate_h3,
-                          h3_tm1)
+        h3_t = GRU(h2_h3_t, h2gate_h3_t, h3_tm1, n_hid, n_hid, random_state)
         return h1_t, h2_t, h3_t
-
-
-    init_x = tensor.fmatrix()
-    init_x.tag.test_value = np_zeros((minibatch_size, 1)).astype(theano.config.floatX)
-    init_embed1 = embedding(init_x, embed1_w)
-    theano.printing.Print("init_x.shape")(init_x.shape)
-    theano.printing.Print("init_embed1.shape")(init_embed1.shape)
-
-    srng = RandomStreams(1999)
-    def sample_step(x_tm1, h1_tm1, h2_tm1, h3_tm1):
-        xinp_h1_t, xgate_h1_t = inp_to_h1.proj(x_tm1)
-        xinp_h2_t, xgate_h2_t = inp_to_h2.proj(x_tm1)
-        xinp_h3_t, xgate_h3_t = inp_to_h3.proj(x_tm1)
-
-        h1_t = cell1.step(xinp_h1_t, xgate_h1_t, h1_tm1)
-        h1inp_h2, h1gate_h2 = h1_to_h2.proj(h1_t)
-        h1inp_h3, h1gate_h3 = h1_to_h3.proj(h1_t)
-
-
-        h2_t = cell2.step(xinp_h2_t + h1inp_h2,
-                          xgate_h2_t + h1gate_h2, h2_tm1)
-
-        h2inp_h3, h2gate_h3 = h2_to_h3.proj(h2_t)
-
-        h3_t = cell3.step(xinp_h3_t + h1inp_h3 + h2inp_h3,
-                          xgate_h3_t + h1gate_h3 + h2gate_h3,
-                          h3_tm1)
-        out_t = h1_t.dot(h1_to_outs) + h2_t.dot(h2_to_outs) + h3_t.dot(
-            h3_to_outs) + b_to_outs
-
-        pred_t = softmax(out_t.dot(pred_w) + pred_b)
-        theano.printing.Print("pred_t.shape")(pred_t.shape)
-        samp_t = sample_softmax(pred_t, srng)
-        x_t = tensor.cast(samp_t, theano.config.floatX)
-        return x_t, h1_t, h2_t, h3_t
-
-    (sampled, h1_s, h2_s, h3_s) = sample_step(
-        init_embed1, init_h1, init_h2, init_h3)
-    theano.printing.Print("sampled.shape")(sampled.shape)
 
     (h1, h2, h3), updates = theano.scan(
         fn=step,
-        sequences=[inp_h1, inpgate_h1,
-                   inp_h2, inpgate_h2,
-                   inp_h3, inpgate_h3],
+        sequences=[in_h1, ingate_h1],
         outputs_info=[init_h1, init_h2, init_h3])
-
-    outs = h1.dot(h1_to_outs) + h2.dot(h2_to_outs) + h3.dot(h3_to_outs) + b_to_outs
-    pred = softmax(outs.dot(pred_w) + pred_b)
-    theano.printing.Print("pred.shape")(pred.shape)
-    theano.printing.Print("target.shape")(target.shape)
+    out = Linear([h1, h2, h3], [n_hid, n_hid, n_hid], n_bins, random_state)
+    pred = softmax(out)
     shp = target.shape
     target = target.reshape((shp[0], shp[1]))
     target = theano_one_hot(target, n_classes=n_bins)
-    theano.printing.Print("target.shape")(target.shape)
     # dimshuffle so batch is on last axis
     cost = categorical_crossentropy(pred, target)
-    theano.printing.Print("cost.shape")(cost.shape)
-    theano.printing.Print("mask.shape")(mask.shape)
 
     cost = cost * mask.dimshuffle(0, 1)
     # sum over sequence length and features, mean over minibatch
     cost = cost.dimshuffle(1, 0)
-    theano.printing.Print("cost.shape")(cost.shape)
     cost = cost.mean()
     # convert to bits vs nats
     cost = cost * tensor.cast(1.44269504089, theano.config.floatX)
 
-    """
-    l2_penalty = 0
-    for p in list(set(params) - set(biases)):
-        l2_penalty += (p ** 2).sum()
-
-    cost = cost + 1E-3 * l2_penalty
-    """
+    params = param_search(cost, lambda x: hasattr(x, "param"))
     grads = tensor.grad(cost, params)
-    grads = [tensor.clip(g, -1, 1) for g in grads]
-    #grads = gradient_clipping(grads, 10.)
-
+    grads = [tensor.clip(g, -1., 1.) for g in grads]
     learning_rate = 1E-3
-
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
 
@@ -356,9 +229,9 @@ if __name__ == "__main__":
                                           init_h1_i, init_h2_i, init_h3_i],
                                          [pred, h1, h2, h3],
                                         on_unused_input="warn")
-        sample_function = theano.function([init_x, init_h1_i, init_h2_i,
+        sample_function = theano.function([X_sym, init_h1_i, init_h2_i,
                                            init_h3_i],
-                                          [sampled, h1_s, h2_s, h3_s],
+                                          [out, h1, h2, h3],
                                           on_unused_input="warn")
         print("Beginning training loop")
         checkpoint_dict = {}

@@ -8,7 +8,7 @@ from scipy import linalg, fftpack
 from scipy.cluster.vq import kmeans, vq
 from scipy.io import wavfile
 import scipy.signal as sg
-import inspect
+import shutil
 from collections import Iterable, defaultdict
 import socket
 import wave
@@ -21,6 +21,7 @@ import copy
 from collections import Counter
 import time
 import sys
+import inspect
 try:
     import cPickle as pickle
 except ImportError:
@@ -38,6 +39,8 @@ from theano.tensor import nnet
 from theano.tensor.nnet.abstract_conv import conv2d_grad_wrt_inputs
 # Doesn't support binomial with n > 1??
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
+from theano.scan_module.scan_utils import infer_shape
+from theano.gof.fg import MissingInputError
 try:
     import urllib.request as urllib  # for backwards compatibility
 except ImportError:
@@ -56,6 +59,189 @@ def coroutine(func):
     return start
 """
 end decorators
+"""
+"""
+begin metautils
+"""
+def alt_shape_of_variables(inputs, outputs, input_shapes):
+    # Thanks to P. Lamblin, F. Bastien for help to make this work
+    # mapping from initial to cloned var
+    equiv = theano.gof.graph.clone_get_equiv(inputs, outputs)
+    cloned_inputs = [equiv[inp] for inp in inputs]
+    cloned_outputs = [equiv[out] for out in outputs]
+    cloned_shapes = {equiv[k]: v for k, v in input_shapes.items()}
+    fgraph = theano.FunctionGraph(cloned_inputs, cloned_outputs, clone=False)
+    if not hasattr(fgraph, 'shape_feature'):
+        fgraph.attach_feature(tensor.opt.ShapeFeature())
+
+    kept_input = [n for n, f in enumerate(fgraph.inputs)
+                  if f in fgraph.shape_feature.shape_of.keys()]
+
+    input_dims = [dimension for kept_idx in kept_input
+                  for dimension in fgraph.shape_feature.shape_of[
+                      fgraph.inputs[kept_idx]]]
+    """
+    # The old way
+    output_dims = [dimension for f, shape in
+                   fgraph.shape_feature.shape_of.items()
+                   for dimension in shape
+                   if f in fgraph.outputs]
+    """
+
+    output_dims = list(*infer_shape(cloned_outputs, cloned_inputs,
+                                    [input_shapes[k] for k in inputs]))
+
+    try:
+        compute_shapes = theano.function(input_dims,
+                                         output_dims,
+                                         mode=theano.Mode(optimizer=None),
+                                         on_unused_input="ignore")
+
+        numeric_input_dims = [dim for kept_idx in kept_input
+                              for dim in cloned_shapes[fgraph.inputs[kept_idx]]]
+
+        numeric_output_dims = compute_shapes(*numeric_input_dims)
+    except MissingInputError:
+        # need to add fake datasets and masks to input args for ?? reasons
+        # unfortunate things might start happening if intermediate vars named
+        # example that activated this code path
+        # data -> linear -> tanh_rnn_layer
+        dataset_and_mask_indices = [n for n, f in enumerate(fgraph.inputs)
+                                    if f.name is not None]
+        compute_shapes = theano.function(
+            [fgraph.inputs[i] for i in dataset_and_mask_indices] + input_dims,
+            output_dims,
+            mode=theano.Mode(optimizer=None),
+            on_unused_input="ignore")
+
+        numeric_input_dims = [dim for kept_idx in kept_input
+                              for dim in cloned_shapes[fgraph.inputs[kept_idx]]]
+        fake_numeric_data = [np.ones(
+            cloned_shapes[fgraph.inputs[i]]).astype(fgraph.inputs[i].dtype)
+            for i in dataset_and_mask_indices]
+
+        numeric_inputs = fake_numeric_data + numeric_input_dims
+
+        numeric_output_dims = compute_shapes(*numeric_inputs)
+
+    final_shapes = {}
+    # This assumes only 1 OUTPUT!!!
+    for var in fgraph.outputs:
+        final_shapes[var] = np.array(numeric_output_dims).ravel()
+
+    shapes = dict((outputs[n], tuple(np.array(final_shapes[co]).ravel()))
+                  for n, co in enumerate(cloned_outputs))
+    return shapes
+
+
+def get_generic_name():
+    # may need to make this a search for the first non-kdllib reference
+    # make generic name from highest calling context
+    prev_function_name = None
+    for i in range(len(inspect.stack())):
+        (frame, filename, line_number,
+         function_name, lines, index) = inspect.stack()[i]
+        #print(frame, filename, line_number, function_name, lines, index)
+        # Use stack to get easier function name than parsing the code itself
+        if i > 0:
+            _, _, _, prev_function_name, _, _ = inspect.stack()[i - 1]
+        else:
+            prev_function_name = function_name
+        script_name = filename.split(os.sep)[-1]
+        lib_location = os.path.realpath(__file__)
+        lib_name = lib_location.split(os.sep)[-1]
+        if script_name != lib_name:
+            name = script_name + "_" + prev_function_name
+            #print(frame, filename, line_number, function_name, lines, index)
+            return name
+    raise ValueError("Issue in generic name getter")
+
+# Many of these from Ishaan G.
+_params = {}
+def param(name=None, *args, **kwargs):
+    """
+    A wrapper for `theano.shared` which enables parameter sharing in models.
+
+    Creates and returns theano shared variables similarly to `theano.shared`,
+    except if you try to create a param with the same name as a
+    previously-created one, `param(...)` will just return the old one instead of
+    making a new one.
+    This constructor also adds a `param` attribute to the shared variables it
+    creates, so that you can easily search a graph for all params.
+    """
+    if name is None:
+        name = get_generic_name()
+    name = name + "_1"
+    if name in _params:
+        sub = name.split("_")[:-1]
+        matches = [k for k in _params.keys() if k.split("_")[:-1] == sub]
+        num = len(matches) + 1
+        name = "_".join(sub) + "_%i" % num
+    kwargs['name'] = name
+    param = as_shared(*args, **kwargs)
+    param.param = True
+    _params[name] = param
+    return _params[name]
+
+
+def delete_params(name):
+    to_delete = [p_name for p_name in _params if name in p_name]
+    for p_name in to_delete:
+        del _params[p_name]
+
+
+def param_search(node, critereon):
+    """
+    Traverse the Theano graph starting at `node` and return a list of all nodes
+    which match the `critereon` function. When optimizing a cost function, you
+    can use this to get a list of all of the trainable params in the graph, like
+    so:
+    `lib.search(cost, lambda x: hasattr(x, "param"))`
+    """
+    def _search(node, critereon, visited):
+        if node in visited:
+            return []
+        visited.add(node)
+
+        results = []
+        if isinstance(node, tensor.Apply):
+            for inp in node.inputs:
+                results += _search(inp, critereon, visited)
+        else: # Variable node
+            if critereon(node):
+                results.append(node)
+            if node.owner is not None:
+                results += _search(node.owner, critereon, visited)
+        return results
+    return _search(node, critereon, set())
+
+
+def save_params(path):
+    raise ValueError("fix it, unify with save coroutine")
+    param_vals = {}
+    for name, param in _params.iteritems():
+        param_vals[name] = param.get_value()
+
+    with open(path, 'wb') as f:
+        pickle.dump(param_vals, f)
+
+
+def load_params(path):
+    raise ValueError("fix it, unify")
+    with open(path, 'rb') as f:
+        param_vals = pickle.load(f)
+
+    for name, val in param_vals.iteritems():
+        _params[name].set_value(val)
+
+
+def clear_all_params():
+    to_delete = [p_name for p_name in _params]
+    for p_name in to_delete:
+        del _params[p_name]
+
+"""
+end metautils
 """
 
 """
@@ -103,8 +289,9 @@ def get_resource_dir(name, resource_dir=None, folder=None, create_dir=True):
         resource_dir = os.path.join(resource_dir, name)
     else:
         resource_dir = os.path.join(resource_dir, folder)
-    if not os.path.exists(resource_dir) and create_dir:
-        os.makedirs(resource_dir)
+    if create_dir:
+        if not os.path.exists(resource_dir):
+            os.makedirs(resource_dir)
     return resource_dir
 
 
@@ -3214,6 +3401,10 @@ def apply_shared(list_of_numpy):
     return [as_shared(arr) for arr in list_of_numpy]
 
 
+def make_numpy_biases(bias_dims):
+    return [np_zeros((dim,)) for dim in bias_dims]
+
+
 def make_biases(bias_dims):
     """
     Will return as many things as are in the list of out_dims
@@ -3222,10 +3413,44 @@ def make_biases(bias_dims):
     or
     [blah] = make_biases(...)
     """
-    return apply_shared([np_zeros((dim,)) for dim in bias_dims])
+    bs = make_numpy_biases(bias_dims)
+    return apply_shared(bs)
 
 
-def make_weights(in_dim, out_dims, random_state, init="normal",
+def make_numpy_weights(in_dim, out_dims, random_state, init=None,
+                       scale="default"):
+    """
+    Will return as many things as are in the list of out_dims
+    You *must* get a list back, even for 1 element returned!
+    blah, = make_weights(...)
+    or
+    [blah] = make_weights(...)
+    """
+    ff = [None] * len(out_dims)
+    for i, out_dim in enumerate(out_dims):
+        if init == None:
+            if in_dim == out_dim:
+                ff[i] = np_ortho
+            else:
+                ff[i] = np_variance_scaled_uniform
+        elif init == "normal":
+            ff[i] = np_normal
+        elif init == "fan":
+            ff[i] = np_tanh_fan_normal
+        elif init == "ortho":
+            ff[i] = np_ortho
+        else:
+            raise ValueError("Unknown init type %s" % init)
+    if scale == "default":
+        ws = [ff[i]((in_dim, out_dim), random_state)
+              for i, out_dim in enumerate(out_dims)]
+    else:
+        ws = [ff[i]((in_dim, out_dim), random_state, scale=scale)
+              for i, out_dim in enumerate(out_dims)]
+    return ws
+
+
+def make_weights(in_dim, out_dims, random_state, init=None,
                  scale="default"):
     """
     Will return as many things as are in the list of out_dims
@@ -3234,23 +3459,72 @@ def make_weights(in_dim, out_dims, random_state, init="normal",
     or
     [blah] = make_weights(...)
     """
-    if init == "normal":
-        ff = np_normal
-    elif init == "fan":
-        ff = np_tanh_fan_normal
-    elif init == "ortho":
-        ff = np_ortho
+    ws = make_numpy_weights(in_dim, out_dims, random_state, init=init,
+                            scale=scale)
+    return apply_shared(ws)
+
+
+def LearnedHiddenInit(list_of_inputs, list_of_shapes):
+    # Helper to switch for learned hidden inits
+    ret = []
+    assert len(list_of_inputs) == len(list_of_shapes)
+    for i, shp in enumerate(list_of_shapes):
+        name = None
+        s = param(name, 0 * make_numpy_weights(shp[0], [shp[1]], np.random.RandomState())[0])
+        init = theano.ifelse.ifelse(tensor.abs_(s.sum()) < 1E-12,
+                                    s, list_of_inputs[i])
+        ret.append(init)
+    return ret
+
+
+def Embedding(indices, n_symbols, output_dim, random_state, name=None):
+    """
+    Last dimension must be 1!!!!
+    """
+    vectors = param(name,
+        random_state.randn(
+            n_symbols,
+            output_dim
+        ).astype(theano.config.floatX)
+    )
+    ii = indices.astype("int32")
+    output_shape = [
+        ii.shape[i]
+        for i in range(ii.ndim - 1)
+    ] + [output_dim]
+    return vectors[ii.flatten()].reshape(output_shape)
+
+
+def Linear(list_of_inputs, input_dims, output_dim, random_state, name=None,
+           init=None, scale="default", weight_norm=True, biases=True):
+
+    input_var = tensor.concatenate(list_of_inputs, axis=-1)
+    input_dim = sum(input_dims)
+    weight_values, = make_numpy_weights(input_dim, [output_dim],
+                                        random_state=random_state,
+                                        init=init, scale=scale)
+    terms = []
+    weight = param(name, weight_values)
+    # From Ishaan G.
+    # http://arxiv.org/abs/1602.07868
+    if weight_norm:
+        norm_values = np.linalg.norm(weight_values, axis=0)
+        norms = param(name, norm_values)
+        normed_weight = weight * (norms / weight.norm(2, axis=0)).dimshuffle('x', 0)
+        terms.append(tensor.dot(input_var, normed_weight))
     else:
-        raise ValueError("Unknown init %s" % init)
-    if scale == "default":
-        return apply_shared([ff((in_dim, out_dim), random_state)
-                             for out_dim in out_dims])
-    else:
-        return apply_shared([ff((in_dim, out_dim), random_state, scale=scale)
-                             for out_dim in out_dims])
+        terms.append(tensor.dot(input_var, weight))
+
+    if biases:
+        b, = make_numpy_biases([output_dim])
+        terms.append(param(name, b))
+    out = reduce(lambda a, b: a + b, terms)
+    out.name = get_generic_name() + ".output"
+    return out
 
 
 def embedding(index_array, embedding_weights):
+    raise ValueError("deprecated")
     """
     expects an index array of shape (N, M, 1) or (M, 1)
     outputs an array of shape (N, M, embedding_weights.shape[1])
@@ -3359,7 +3633,8 @@ def t_conv_out_size(input_size, filter_size, stride, pad):
     return output_size
 
 
-def gru_weights(input_dim, hidden_dim, forward_init="normal", hidden_init="normal", random_state=None):
+def gru_weights(input_dim, hidden_dim, forward_init=None, hidden_init="normal",
+                random_state=None):
     if random_state is None:
         raise ValueError("Must pass random_state!")
     shape = (input_dim, hidden_dim)
@@ -3371,6 +3646,18 @@ def gru_weights(input_dim, hidden_dim, forward_init="normal", hidden_init="norma
         W = np.hstack([np_tanh_fan_normal(shape, random_state),
                        np_tanh_fan_normal(shape, random_state),
                        np_tanh_fan_normal(shape, random_state)])
+    elif forward_init == None:
+        if input_dim == hidden_dim:
+            W = np.hstack([np_ortho(shape, random_state),
+                           np_ortho(shape, random_state),
+                           np_ortho(shape, random_state)])
+        else:
+            # lecun
+            W = np.hstack([np_variance_scaled_uniform(shape, random_state),
+                           np_variance_scaled_uniform(shape, random_state),
+                           np_variance_scaled_uniform(shape, random_state)])
+    else:
+        raise ValueError("Unknown forward init type %s" % forward_init)
     b = np_zeros((3 * shape[1],))
 
     if hidden_init == "normal":
@@ -3384,60 +3671,40 @@ def gru_weights(input_dim, hidden_dim, forward_init="normal", hidden_init="norma
     return W, b, Wur, U
 
 
-class GRU(object):
-    def __init__(self, input_dim, hidden_dim, random_state=None, hidden_init="ortho"):
-        if random_state is None:
-            raise ValueError("Must pass random_state")
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        W, b, Wur, U = gru_weights(input_dim, hidden_dim, hidden_init=hidden_init, random_state=random_state)
-        self.Wur = as_shared(Wur)
-        self.U = as_shared(U)
-        self.shape = (input_dim, hidden_dim)
-
-    def get_params(self):
-        return self.Wur, self.U
-
-    def get_biases(self):
-        raise AttributeError("GRU cell has no biases!")
-
-    def step(self, inp, gate_inp, prev_state):
-        dim = self.shape[1]
-        gates = tensor.nnet.sigmoid(tensor.dot(prev_state, self.Wur) + gate_inp)
+def GRU(inp, gate_inp, previous_state, input_dim, hidden_dim, random_state,
+        name=None, init=None, scale="default", weight_norm=True, biases=True):
+        if init == None:
+            hidden_init="ortho"
+        else:
+            raise ValueError("Not yet configured for other inits")
+        _, _, Wur, U = gru_weights(input_dim, hidden_dim,
+                                   hidden_init=hidden_init,
+                                   random_state=random_state)
+        Wur = param(name, Wur)
+        U = param(name, U)
+        dim = hidden_dim
+        gates = tensor.nnet.sigmoid(tensor.dot(previous_state, Wur) + gate_inp)
         update = gates[:, :dim]
         reset = gates[:, dim:]
-        state_reset = prev_state * reset
-        next_state = tensor.tanh(tensor.dot(state_reset, self.U) + inp)
-        next_state = next_state * update + prev_state * (1 - update)
+        state_reset = previous_state * reset
+        next_state = tensor.tanh(tensor.dot(state_reset, U) + inp)
+        next_state = next_state * update + previous_state * (1 - update)
         return next_state
 
 
-class GRUFork(object):
-    def __init__(self, input_dim, hidden_dim, random_state=None, forward_init="fan"):
-        if random_state is None:
-            raise ValueError("Must pass random_state")
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        W, b, Wur, U = gru_weights(input_dim, hidden_dim, forward_init=forward_init, random_state=random_state)
-        self.W = as_shared(W)
-        self.b = as_shared(b)
-        self.shape = (input_dim, hidden_dim)
-
-    def get_params(self):
-        return self.W, self.b
-
-    def get_biases(self):
-        return [self.b]
-
-    def proj(self, inp):
-        dim = self.shape[1]
-        projected = tensor.dot(inp, self.W) + self.b
-        if projected.ndim == 3:
-            d = projected[:, :, :dim]
-            g = projected[:, :, dim:]
+def GRUFork(list_of_inputs, input_dims, output_dim, random_state, name=None,
+             init=None, scale="default", weight_norm=True, biases=True):
+        # 3 gates so 3 * output_dim
+        gates = Linear(list_of_inputs, input_dims, 3 * output_dim, random_state=random_state,
+                       name=name, init=init, scale=scale, weight_norm=weight_norm,
+                       biases=biases)
+        dim = output_dim
+        if gates.ndim == 3:
+            d = gates[:, :, :dim]
+            g = gates[:, :, dim:]
         else:
-            d = projected[:, :dim]
-            g = projected[:, dim:]
+            d = gates[:, :dim]
+            g = gates[:, dim:]
         return d, g
 
 
@@ -4221,6 +4488,26 @@ def implot(arr, title="", cmap="gray", save_name=None):
     else:
         plt.savefig(save_name)
 
+def _archive(tag=None):
+    script_name = get_script_name()[:-3]
+    save_path = get_resource_dir(script_name)
+    if tag is None:
+        save_script_path = os.path.join(save_path, get_script_name())
+    else:
+        save_script_path = os.path.join(save_path, tag + "_" + get_script_name())
+
+    print("Saving code archive for %s" % (save_path))
+    script_location = os.path.abspath(sys.argv[0])
+    shutil.copy2(script_location, save_script_path)
+
+    lib_location = os.path.realpath(__file__)
+    lib_name = lib_location.split(os.sep)[-1]
+    if tag is None:
+        save_lib_path = os.path.join(save_path, lib_name)
+    else:
+        save_lib_path = os.path.join(save_path, tag + "_" + lib_name)
+    shutil.copy2(lib_location, save_lib_path)
+
 
 class Igor(object):
     """
@@ -4309,7 +4596,6 @@ def run_loop(loop_function, train_function, train_itr,
     loop function should return a list of costs
     stateful_object allows to serialize and relaunch in middle of an epoch
     for long training models
-    TODO: add serialization of kdllib.py and calling script with id tagged in name
     """
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
@@ -4389,6 +4675,8 @@ def run_loop(loop_function, train_function, train_itr,
 
         start_epoch = 0
 
+    # save current state of kdllib and calling script
+    _archive(ident)
 
     tcw = threaded_checkpoint_writer()
     tww = threaded_weights_writer()
