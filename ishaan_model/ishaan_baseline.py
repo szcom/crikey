@@ -8,8 +8,9 @@ import os
 import sys
 from kdllib import audio_file_iterator
 from kdllib import numpy_one_hot, apply_quantize_preproc
-from kdllib import param, param_search
-from kdllib import LearnedHiddenInit
+from kdllib import numpy_softmax, numpy_sample_softmax
+from kdllib import param, param_search, print_param_info
+from kdllib import LearnedInitHidden
 from kdllib import Linear
 from kdllib import Embedding
 from kdllib import Igor
@@ -47,7 +48,6 @@ if __name__ == "__main__":
     input_dim = 256
     n_embed = 256
     n_hid = 512
-    n_proj = 512
     n_bins = 256
 
     desc = "Speech generation"
@@ -67,6 +67,19 @@ if __name__ == "__main__":
     parser.add_argument('-sl', '--sample_length',
                         help='Number of steps to sample, default is automatic',
                         type=restricted_int,
+                        default=None,
+                        required=False)
+    def restricted_float(x):
+        if x is None:
+            # None makes it "auto" temperature
+            return x
+        x = float(x)
+        if x <= 0:
+            raise argparse.ArgumentTypeError("%r not range (0, inf]" % (x,))
+        return x
+    parser.add_argument('-t', '--temperature',
+                        help='Sampling temperature for softmax',
+                        type=restricted_float,
                         default=None,
                         required=False)
     parser.add_argument('-c', '--continue', dest="cont",
@@ -93,44 +106,56 @@ if __name__ == "__main__":
         predict_function = checkpoint_dict["predict_function"]
         sample_function = checkpoint_dict["sample_function"]
 
+        if args.temperature is None:
+            args.temperature = 1.
         if args.sample_length is None:
             raise ValueError("NYI - use -sl or --sample_length ")
         else:
             fixed_steps = args.sample_length
+            temperature = args.temperature
             completed = []
             # 0 is in the middle
-            init_x = 127 + np_zeros((minibatch_size, 1)).astype(theano.config.floatX)
+            # CANNOT BE 1 timestep - will get floating point exception!
+            # 2 may still be buggy because X_sym gets sliced and scan gets mad with 1 timestep usually...
+            init_x = 127 + np_zeros((fixed_steps, minibatch_size, 1)).astype(theano.config.floatX)
             for i in range(fixed_steps):
                 if i % 100 == 0:
                     print("Sampling step %i" % i)
-                # remove second init_x later
                 rvals = sample_function(init_x, prev_h1, prev_h2,
                                         prev_h3)
                 sampled, h1_s, h2_s, h3_s = rvals
-                completed.append(sampled)
-                sampled = sampled.astype(theano.config.floatX)[:, None]
-                # cheating sampling...
-                #init_x = numpy_one_hot(X_mb[i].ravel().astype("int32"), input_dim).astype(theano.config.floatX)
+                pred_s = numpy_softmax(sampled, temperature=temperature)
+                # debug=True gives argmax
+                # use 0 since it is a moving window
+                choice = numpy_sample_softmax(pred_s[0], random_state)
+                choice = choice[None]
+                completed.append(choice)
 
-                init_x = sampled
-                prev_h1 = h1_s
-                prev_h2 = h2_s
-                prev_h3 = h3_s
+                # use 3 since scan is throwing exceptions
+                init_x = np.concatenate((choice[..., None], choice[..., None], choice[..., None]),
+                                        axis=0)
+                init_x = init_x.astype(theano.config.floatX)
+                # use next step
+                prev_h1 = h1_s[0]
+                prev_h2 = h2_s[0]
+                prev_h3 = h3_s[0]
             print("Completed sampling after %i steps" % fixed_steps)
             # mb, length
-            completed = np.array(completed)
+            completed = np.array(completed)[:, 0, :]
             completed = completed.transpose(1, 0)
             # all samples would be range(len(completed))
             for i in range(10):
                 ex = completed[i].ravel()
                 s = "gen_%i.wav" % (i)
+                """
                 ex = ex.astype("float32")
                 ex -= ex.min()
                 ex /= ex.max()
                 ex -= 0.5
                 ex *= 0.95
                 wavfile.write(s, fs, ex)
-                #wavfile.write(s, fs, soundsc(ex))
+                """
+                wavfile.write(s, fs, soundsc(ex))
         print("Sampling complete, exiting...")
         sys.exit()
     else:
@@ -150,7 +175,7 @@ if __name__ == "__main__":
     init_h3_i = tensor.matrix("init_h3")
     init_h3_i.tag.test_value = np_zeros((minibatch_size, n_hid))
 
-    init_h1, init_h2, init_h3 = LearnedHiddenInit(
+    init_h1, init_h2, init_h3 = LearnedInitHidden(
         [init_h1_i, init_h2_i, init_h3_i], 3 * [(minibatch_size, n_hid)])
 
     inpt = X_sym[:-1]
@@ -159,31 +184,41 @@ if __name__ == "__main__":
     embed_dim = 256
     embed1 = Embedding(inpt, 256, embed_dim, random_state)
     in_h1, ingate_h1 = GRUFork([embed1], [embed_dim], n_hid, random_state)
+    in_h2, ingate_h2 = GRUFork([embed1], [embed_dim], n_hid, random_state)
+    in_h3, ingate_h3 = GRUFork([embed1], [embed_dim], n_hid, random_state)
 
     def step(in_h1_t, ingate_h1_t,
+             in_h2_t, ingate_h2_t,
+             in_h3_t, ingate_h3_t,
              h1_tm1, h2_tm1, h3_tm1):
         h1_t = GRU(in_h1_t, ingate_h1_t, h1_tm1, n_hid, n_hid, random_state)
         h1_h2_t, h1gate_h2_t = GRUFork([h1_t], [n_hid], n_hid, random_state)
+        h1_h3_t, h1gate_h3_t = GRUFork([h1_t], [n_hid], n_hid, random_state)
 
-        h2_t = GRU(h1_h2_t, h1gate_h2_t, h2_tm1, n_hid, n_hid, random_state)
+        h2_t = GRU(h1_h2_t + in_h2_t, h1gate_h2_t + ingate_h2_t, h2_tm1,
+                   n_hid, n_hid, random_state)
 
         h2_h3_t, h2gate_h3_t = GRUFork([h2_t], [n_hid], n_hid, random_state)
 
-        h3_t = GRU(h2_h3_t, h2gate_h3_t, h3_tm1, n_hid, n_hid, random_state)
+        h3_t = GRU(h2_h3_t + in_h3_t + h1_h3_t,
+                   h2gate_h3_t + ingate_h3_t + h1gate_h3_t, h3_tm1,
+                   n_hid, n_hid, random_state)
         return h1_t, h2_t, h3_t
 
     (h1, h2, h3), updates = theano.scan(
         fn=step,
-        sequences=[in_h1, ingate_h1],
+        sequences=[in_h1, ingate_h1,
+                   in_h2, ingate_h2,
+                   in_h3, ingate_h3],
         outputs_info=[init_h1, init_h2, init_h3])
-    out = Linear([h1, h2, h3], [n_hid, n_hid, n_hid], n_bins, random_state)
+    out = Linear([embed1, h1, h2, h3], [embed_dim, n_hid, n_hid, n_hid],
+                 n_bins, random_state)
     pred = softmax(out)
     shp = target.shape
     target = target.reshape((shp[0], shp[1]))
     target = theano_one_hot(target, n_classes=n_bins)
     # dimshuffle so batch is on last axis
     cost = categorical_crossentropy(pred, target)
-
     cost = cost * mask.dimshuffle(0, 1)
     # sum over sequence length and features, mean over minibatch
     cost = cost.dimshuffle(1, 0)
@@ -192,9 +227,11 @@ if __name__ == "__main__":
     cost = cost * tensor.cast(1.44269504089, theano.config.floatX)
 
     params = param_search(cost, lambda x: hasattr(x, "param"))
+    print_param_info(params)
+
     grads = tensor.grad(cost, params)
     grads = [tensor.clip(g, -1., 1.) for g in grads]
-    learning_rate = 1E-3
+    learning_rate = 2E-4
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
 
@@ -225,12 +262,12 @@ if __name__ == "__main__":
                                           init_h1_i, init_h2_i, init_h3_i],
                                          [cost, h1, h2, h3],
                                          on_unused_input="warn")
-        predict_function = theano.function([X_sym, X_mask_sym,
-                                          init_h1_i, init_h2_i, init_h3_i],
-                                         [pred, h1, h2, h3],
+        predict_function = theano.function([inpt,
+                                           init_h1_i, init_h2_i, init_h3_i],
+                                          [out, h1, h2, h3],
                                         on_unused_input="warn")
-        sample_function = theano.function([X_sym, init_h1_i, init_h2_i,
-                                           init_h3_i],
+        sample_function = theano.function([inpt,
+                                           init_h1_i, init_h2_i, init_h3_i],
                                           [out, h1, h2, h3],
                                           on_unused_input="warn")
         print("Beginning training loop")
@@ -245,6 +282,8 @@ if __name__ == "__main__":
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
         X_mb, X_mb_mask = next(itr)
+        # Sanity check there are no bugs in the mask
+        assert X_mb_mask.min() > 1E-6
         n_cuts = len(X_mb) // cut_len + 1
         partial_costs = []
         for n in range(n_cuts):

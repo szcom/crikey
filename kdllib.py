@@ -45,6 +45,7 @@ try:
     import urllib.request as urllib  # for backwards compatibility
 except ImportError:
     import urllib2 as urllib
+import locale
 
 sys.setrecursionlimit(40000)
 
@@ -63,77 +64,6 @@ end decorators
 """
 begin metautils
 """
-def alt_shape_of_variables(inputs, outputs, input_shapes):
-    # Thanks to P. Lamblin, F. Bastien for help to make this work
-    # mapping from initial to cloned var
-    equiv = theano.gof.graph.clone_get_equiv(inputs, outputs)
-    cloned_inputs = [equiv[inp] for inp in inputs]
-    cloned_outputs = [equiv[out] for out in outputs]
-    cloned_shapes = {equiv[k]: v for k, v in input_shapes.items()}
-    fgraph = theano.FunctionGraph(cloned_inputs, cloned_outputs, clone=False)
-    if not hasattr(fgraph, 'shape_feature'):
-        fgraph.attach_feature(tensor.opt.ShapeFeature())
-
-    kept_input = [n for n, f in enumerate(fgraph.inputs)
-                  if f in fgraph.shape_feature.shape_of.keys()]
-
-    input_dims = [dimension for kept_idx in kept_input
-                  for dimension in fgraph.shape_feature.shape_of[
-                      fgraph.inputs[kept_idx]]]
-    """
-    # The old way
-    output_dims = [dimension for f, shape in
-                   fgraph.shape_feature.shape_of.items()
-                   for dimension in shape
-                   if f in fgraph.outputs]
-    """
-
-    output_dims = list(*infer_shape(cloned_outputs, cloned_inputs,
-                                    [input_shapes[k] for k in inputs]))
-
-    try:
-        compute_shapes = theano.function(input_dims,
-                                         output_dims,
-                                         mode=theano.Mode(optimizer=None),
-                                         on_unused_input="ignore")
-
-        numeric_input_dims = [dim for kept_idx in kept_input
-                              for dim in cloned_shapes[fgraph.inputs[kept_idx]]]
-
-        numeric_output_dims = compute_shapes(*numeric_input_dims)
-    except MissingInputError:
-        # need to add fake datasets and masks to input args for ?? reasons
-        # unfortunate things might start happening if intermediate vars named
-        # example that activated this code path
-        # data -> linear -> tanh_rnn_layer
-        dataset_and_mask_indices = [n for n, f in enumerate(fgraph.inputs)
-                                    if f.name is not None]
-        compute_shapes = theano.function(
-            [fgraph.inputs[i] for i in dataset_and_mask_indices] + input_dims,
-            output_dims,
-            mode=theano.Mode(optimizer=None),
-            on_unused_input="ignore")
-
-        numeric_input_dims = [dim for kept_idx in kept_input
-                              for dim in cloned_shapes[fgraph.inputs[kept_idx]]]
-        fake_numeric_data = [np.ones(
-            cloned_shapes[fgraph.inputs[i]]).astype(fgraph.inputs[i].dtype)
-            for i in dataset_and_mask_indices]
-
-        numeric_inputs = fake_numeric_data + numeric_input_dims
-
-        numeric_output_dims = compute_shapes(*numeric_inputs)
-
-    final_shapes = {}
-    # This assumes only 1 OUTPUT!!!
-    for var in fgraph.outputs:
-        final_shapes[var] = np.array(numeric_output_dims).ravel()
-
-    shapes = dict((outputs[n], tuple(np.array(final_shapes[co]).ravel()))
-                  for n, co in enumerate(cloned_outputs))
-    return shapes
-
-
 def get_generic_name():
     # may need to make this a search for the first non-kdllib reference
     # make generic name from highest calling context
@@ -156,7 +86,39 @@ def get_generic_name():
             return name
     raise ValueError("Issue in generic name getter")
 
+
 # Many of these from Ishaan G.
+def print_param_info(params):
+    """Print information about the parameters in the given param set."""
+
+    params = sorted(params, key=lambda p: p.name)
+    values = [p.get_value(borrow=True) for p in params]
+    shapes = [p.shape for p in values]
+    print("Params:")
+    for param, value, shape in zip(params, values, shapes):
+        print("\t%s (%s)" % (param.name, ",".join([str(x) for x in shape])))
+
+    total_param_count = 0
+    for shape in shapes:
+        param_count = 1
+        for dim in shape:
+            param_count *= dim
+        total_param_count += param_count
+    print("Total parameter count: %f M" % (total_param_count / float(1E6)))
+
+
+def flatten(seq):
+    l = []
+    for elt in seq:
+        t = type(elt)
+        if t is tuple or t is list:
+            for elt2 in flatten(elt):
+                l.append(elt2)
+        else:
+            l.append(elt)
+    return l
+
+
 _params = {}
 def param(name=None, *args, **kwargs):
     """
@@ -169,17 +131,46 @@ def param(name=None, *args, **kwargs):
     This constructor also adds a `param` attribute to the shared variables it
     creates, so that you can easily search a graph for all params.
     """
+
+    had_ext = False
+    if type(name) is tuple or type(name) is list:
+        name = flatten(name)
+        name_ext = name[1:]
+        name = name[0]
+        had_ext = True
+
     if name is None:
         name = get_generic_name()
+
     name = name + "_1"
-    if name in _params:
-        sub = name.split("_")[:-1]
-        matches = [k for k in _params.keys() if k.split("_")[:-1] == sub]
+    sub = name.split("_")
+    # skip purely numbers
+    ss = []
+    for s in sub:
+        try:
+            int(s)
+        except:
+            ss.append(s)
+    sub = ss
+
+    def key_fn(k):
+        tt = k.split("_")[:len(sub)]
+        return tt
+    matches = [k for k in _params.keys()
+               if key_fn(k) == sub]
+    if len(matches) > 0:
         num = len(matches) + 1
         name = "_".join(sub) + "_%i" % num
+
+    # Ability to append info
+    if had_ext:
+        ns = name.split("_")
+        name = "_".join(ns[:-1] + name_ext + [ns[-1]])
+
     kwargs['name'] = name
     param = as_shared(*args, **kwargs)
     param.param = True
+    param.name = name
     _params[name] = param
     return _params[name]
 
@@ -3464,22 +3455,23 @@ def make_weights(in_dim, out_dims, random_state, init=None,
     return apply_shared(ws)
 
 
-def LearnedHiddenInit(list_of_inputs, list_of_shapes):
-    # Helper to switch for learned hidden inits
+def LearnedInitHidden(list_of_inputs, list_of_shapes):
+    # Helper to allow switch for learned hidden inits
     ret = []
     assert len(list_of_inputs) == len(list_of_shapes)
     for i, shp in enumerate(list_of_shapes):
         name = None
-        s = param(name, 0 * make_numpy_weights(shp[0], [shp[1]], np.random.RandomState())[0])
-        init = theano.ifelse.ifelse(tensor.abs_(s.sum()) < 1E-12,
-                                    s, list_of_inputs[i])
+        s = param(name, make_numpy_biases([shp[1]])[0])
+        ss = s[None, :] * tensor.ones((shp[0], shp[1]))
+        init = theano.ifelse.ifelse(tensor.abs_(ss.sum()) < 1E-12,
+                                    ss, list_of_inputs[i])
         ret.append(init)
     return ret
 
 
 def Embedding(indices, n_symbols, output_dim, random_state, name=None):
     """
-    Last dimension must be 1!!!!
+    Last dimension of indices tensor must be 1!!!!
     """
     vectors = param(name,
         random_state.randn(
@@ -3496,53 +3488,42 @@ def Embedding(indices, n_symbols, output_dim, random_state, name=None):
 
 
 def Linear(list_of_inputs, input_dims, output_dim, random_state, name=None,
-           init=None, scale="default", weight_norm=True, biases=True):
-
+           init=None, scale="default", weight_norm=None, biases=True):
+    """
+    Can pass weights and biases directly if needed through init
+    """
+    if weight_norm is None:
+        # Let other classes delegate to default of linear
+        weight_norm = False
     input_var = tensor.concatenate(list_of_inputs, axis=-1)
     input_dim = sum(input_dims)
-    weight_values, = make_numpy_weights(input_dim, [output_dim],
-                                        random_state=random_state,
-                                        init=init, scale=scale)
     terms = []
-    weight = param(name, weight_values)
+    if (init is None) or (type(init) is str):
+        weight_values, = make_numpy_weights(input_dim, [output_dim],
+                                            random_state=random_state,
+                                            init=init, scale=scale)
+    else:
+        weight_values = init[0]
+    weight = param((name, "W"), weight_values)
     # From Ishaan G.
     # http://arxiv.org/abs/1602.07868
     if weight_norm:
         norm_values = np.linalg.norm(weight_values, axis=0)
-        norms = param(name, norm_values)
+        norms = param((name, "wn"), norm_values)
         normed_weight = weight * (norms / weight.norm(2, axis=0)).dimshuffle('x', 0)
         terms.append(tensor.dot(input_var, normed_weight))
     else:
         terms.append(tensor.dot(input_var, weight))
 
     if biases:
-        b, = make_numpy_biases([output_dim])
-        terms.append(param(name, b))
+        if (init is None) or (type(init) is str):
+            b, = make_numpy_biases([output_dim])
+        else:
+            b = init[1]
+        terms.append(param((name, "b"), b))
     out = reduce(lambda a, b: a + b, terms)
     out.name = get_generic_name() + ".output"
     return out
-
-
-def embedding(index_array, embedding_weights):
-    raise ValueError("deprecated")
-    """
-    expects an index array of shape (N, M, 1) or (M, 1)
-    outputs an array of shape (N, M, embedding_weights.shape[1])
-    or (M, embedding_weights.shape[1])
-    """
-    ii = tensor.cast(index_array, "int32")
-    if ii.ndim == 3:
-        # assuming middle dimension is minibatch
-        output_shape = [ii.shape[0], ii.shape[1], embedding_weights.shape[1]]
-    elif ii.ndim == 2:
-        output_shape = [ii.shape[0], embedding_weights.shape[1]]
-    else:
-        raise ValueError("Unknown input dimension!")
-    theano.printing.Print("index_array.shape")(ii.shape)
-    theano.printing.Print("embedding_weights.shape")(embedding_weights.shape)
-    e = embedding_weights[ii.flatten()].reshape(output_shape)
-    theano.printing.Print("e.shape")(e.shape)
-    return e
 
 
 def make_conv_weights(in_dim, out_dims, kernel_size, random_state):
@@ -3672,7 +3653,7 @@ def gru_weights(input_dim, hidden_dim, forward_init=None, hidden_init="normal",
 
 
 def GRU(inp, gate_inp, previous_state, input_dim, hidden_dim, random_state,
-        name=None, init=None, scale="default", weight_norm=True, biases=True):
+        name=None, init=None, scale="default", weight_norm=None, biases=True):
         if init == None:
             hidden_init="ortho"
         else:
@@ -3680,31 +3661,37 @@ def GRU(inp, gate_inp, previous_state, input_dim, hidden_dim, random_state,
         _, _, Wur, U = gru_weights(input_dim, hidden_dim,
                                    hidden_init=hidden_init,
                                    random_state=random_state)
-        Wur = param(name, Wur)
-        U = param(name, U)
         dim = hidden_dim
-        gates = tensor.nnet.sigmoid(tensor.dot(previous_state, Wur) + gate_inp)
+        f1 = Linear([previous_state], [2 * hidden_dim], 2 * hidden_dim,
+                    random_state, name=(name, "update/reset"), init=[Wur],
+                    biases=False)
+        gates = tensor.nnet.sigmoid(f1 + gate_inp)
         update = gates[:, :dim]
         reset = gates[:, dim:]
         state_reset = previous_state * reset
-        next_state = tensor.tanh(tensor.dot(state_reset, U) + inp)
+        f2 = Linear([state_reset], [hidden_dim], hidden_dim,
+                    random_state, name=(name, "state"), init=[U], biases=False)
+        next_state = tensor.tanh(f2 + inp)
         next_state = next_state * update + previous_state * (1 - update)
         return next_state
 
 
 def GRUFork(list_of_inputs, input_dims, output_dim, random_state, name=None,
-             init=None, scale="default", weight_norm=True, biases=True):
-        # 3 gates so 3 * output_dim
-        gates = Linear(list_of_inputs, input_dims, 3 * output_dim, random_state=random_state,
-                       name=name, init=init, scale=scale, weight_norm=weight_norm,
+            init=None, scale="default", weight_norm=None, biases=True):
+        gates = Linear(list_of_inputs, input_dims, 3 * output_dim,
+                       random_state=random_state,
+                       name=(name, "gates"), init=init, scale=scale,
+                       weight_norm=weight_norm,
                        biases=biases)
         dim = output_dim
-        if gates.ndim == 3:
+        if gates.ndim == 2:
+            d = gates[:, :dim]
+            g = gates[:, dim:]
+        elif gates.ndim == 3:
             d = gates[:, :, :dim]
             g = gates[:, :, dim:]
         else:
-            d = gates[:, :dim]
-            g = gates[:, dim:]
+            raise ValueError("Unsupported ndim")
         return d, g
 
 
@@ -3719,6 +3706,15 @@ def softmax(X):
     # should work for both 2D and 3D
     dim = X.ndim
     e_X = tensor.exp(X - X.max(axis=dim - 1, keepdims=True))
+    out = e_X / e_X.sum(axis=dim - 1, keepdims=True)
+    return out
+
+
+def numpy_softmax(X, temperature=1.):
+    # should work for both 2D and 3D
+    dim = X.ndim
+    X = X / temperature
+    e_X = np.exp((X - X.max(axis=dim - 1, keepdims=True)))
     out = e_X / e_X.sum(axis=dim - 1, keepdims=True)
     return out
 
@@ -3843,6 +3839,20 @@ def sample_softmax(coeff, theano_rng, epsilon=1E-5, debug=False):
         idx = tensor.argmax(theano_rng.multinomial(pvals=coeff, dtype=coeff.dtype),
                             axis=1)
     return tensor.cast(idx, theano.config.floatX)
+
+
+def numpy_sample_softmax(coeff, random_state, debug=False):
+    if coeff.ndim > 2:
+        raise ValueError("Unsupported dim")
+    if debug:
+        idx = coeff.argmax(axis=1)
+    else:
+        # renormalize to avoid numpy errors about summation...
+        coeff = coeff / (coeff.sum(axis=1, keepdims=True) + 1E-6)
+        idxs = [np.argmax(random_state.multinomial(1, pvals=coeff[i]))
+                for i in range(len(coeff))]
+        idx = np.array(idxs)
+    return idx.astype(theano.config.floatX)
 
 
 def sample_diagonal_gmm(mu, sigma, coeff, theano_rng, epsilon=1E-5,
