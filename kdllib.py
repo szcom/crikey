@@ -23,6 +23,11 @@ import time
 import sys
 import inspect
 try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+
+try:
     import cPickle as pickle
 except ImportError:
     import pickle
@@ -46,8 +51,25 @@ try:
 except ImportError:
     import urllib2 as urllib
 import locale
+import logging
 
 sys.setrecursionlimit(40000)
+
+"""
+init logging
+"""
+logging.basicConfig(level=logging.INFO,
+                    format='%(message)s')
+logger = logging.getLogger(__name__)
+
+string_f = StringIO()
+ch = logging.StreamHandler(string_f)
+formatter = logging.Formatter('%(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+"""
+end logging
+"""
 
 """
 begin decorators
@@ -94,9 +116,9 @@ def print_param_info(params):
     params = sorted(params, key=lambda p: p.name)
     values = [p.get_value(borrow=True) for p in params]
     shapes = [p.shape for p in values]
-    print("Params:")
+    logger.info("Params:")
     for param, value, shape in zip(params, values, shapes):
-        print("\t%s (%s)" % (param.name, ",".join([str(x) for x in shape])))
+        logger.info("\t%s (%s)" % (param.name, ",".join([str(x) for x in shape])))
 
     total_param_count = 0
     for shape in shapes:
@@ -104,7 +126,7 @@ def print_param_info(params):
         for dim in shape:
             param_count *= dim
         total_param_count += param_count
-    print("Total parameter count: %f M" % (total_param_count / float(1E6)))
+    logger.info("Total parameter count: %f M" % (total_param_count / float(1E6)))
 
 
 def flatten(seq):
@@ -309,9 +331,9 @@ def download(url, server_fname, local_fname=None, progress_update_percentage=5,
         try:
             file_size = int(meta.get("Content-Length"))
         except TypeError:
-            print("WARNING: Cannot get file size, displaying bytes instead!")
+            logger.info("WARNING: Cannot get file size, displaying bytes instead!")
             file_size = 100
-        print("Downloading: %s Bytes: %s" % (server_fname, file_size))
+        logger.info("Downloading: %s Bytes: %s" % (server_fname, file_size))
         file_size_dl = 0
         block_sz = int(1E7)
         p = 0
@@ -324,7 +346,7 @@ def download(url, server_fname, local_fname=None, progress_update_percentage=5,
             if (file_size_dl * 100. / file_size) > p:
                 status = r"%10d  [%3.2f%%]" % (file_size_dl, file_size_dl *
                                                100. / file_size)
-                print(status)
+                logger.info(status)
                 p += progress_update_percentage
 
 
@@ -337,7 +359,7 @@ def midiwrap():
         from midi.utils import midiread, midiwrite
         sys.path.pop(1)
     except ImportError:
-        print("Need GPL licensed midi utils, downloading...",
+        logger.info("Need GPL licensed midi utils, downloading...",
               "http://www.iro.umontreal.ca/~lisa/deep/midi.zip")
         url = "http://www.iro.umontreal.ca/~lisa/deep/midi.zip"
         partial_path = get_resource_dir("")
@@ -444,8 +466,8 @@ class Blizzard_dataset(object):
         self.input_qsize = 5
         self.min_input_qsize = 2
         if len(self.wav_paths) % self.minibatch_size != 0:
-            print("WARNING: Sample size not an even multiple of minibatch size")
-            print("Truncating...")
+            logger.info("WARNING: Sample size not an even multiple of minibatch size")
+            logger.info("Truncating...")
             self.wav_paths = self.wav_paths[:-(
                 len(self.wav_paths) % self.minibatch_size)]
             self.text = self.text[:-(
@@ -515,7 +537,7 @@ def fetch_sample_audio_chords(n_samples=None):
     wav_names = [fname for fname in tf.getnames()
                  if ".wav" in fname.split(os.sep)[-1]]
     chords = []
-    print("Loading audio files...")
+    logger.info("Loading audio files...")
     for wav_name in wav_names[:n_samples]:
         f = tf.extractfile(wav_name)
         fs, d = wavfile.read(f)
@@ -535,7 +557,7 @@ def fetch_sample_speech_fruit(n_samples=None):
     wav_names = [fname for fname in tf.getnames()
                  if ".wav" in fname.split(os.sep)[-1]]
     speech = []
-    print("Loading speech files...")
+    logger.info("Loading speech files...")
     for wav_name in wav_names[:n_samples]:
         f = tf.extractfile(wav_name)
         fs, d = wavfile.read(f)
@@ -614,7 +636,7 @@ def fetch_sample_speech_ono(n_samples=None):
                  if "PAIN" in w]
 
     speech = []
-    print("Loading speech files...")
+    logger.info("Loading speech files...")
     for wav_name in wav_names[:n_samples]:
         fs, bitw, d = readwav(wav_name)
         # 24 bit but only 16 used???
@@ -633,7 +655,7 @@ def fetch_sample_speech_walla(n_samples=None):
     speech = []
     wav_names = []
 
-    print("Loading speech files...")
+    logger.info("Loading speech files...")
     for name in names[:n_samples]:
         fs, bitw, d = readwav(name)
         d = d.astype('float32') / (2 ** 15)
@@ -1874,14 +1896,17 @@ def apply_quantize_preproc(X, n_bins=256, mn=-32768, mx=32768):
 
 def apply_quantize_window_preproc(X, n_bins=256, n_frame=4, mn=-32768, mx=32768):
     def scale(x):
-        x = (x - mn) / (mx - mn)
+        # scale to 0, 1
+        x = a.astype("float64")
+        x = (x - x.min()) / (x.max() - x.min())
         return x
 
     # Extra n because bin is reserved kwd in Python
     bins = np.linspace(0, 1, n_bins)
     def binn(x):
-        shp = x.shape
-        return (np.digitize(x.ravel(), bins) - 1).reshape(shp)
+        x = x * (bins - 0.5) # 0 to 255.5
+        x = x.astype("int32").astype("float32")
+        return x
     X = [scale(Xi) for Xi in X]
     X = [binn(Xi) for Xi in X]
 
@@ -4279,7 +4304,7 @@ def set_shared_variables_in_function(func, list_of_values):
 
 
 def save_weights(save_path, items_dict, use_resource_dir=True):
-    print("not saving weights due to copy issues in npz")
+    logger.info("not saving weights due to copy issues in npz")
     return
     weights_dict = {}
     # k is the function name, v is a theano function
@@ -4293,13 +4318,13 @@ def save_weights(save_path, items_dict, use_resource_dir=True):
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    print("saving weights to %s" % save_weights_path)
+    logger.info("saving weights to %s" % save_weights_path)
     if len(weights_dict.keys()) > 0:
         np.savez(save_path, **weights_dict)
     else:
-        print("Possible BUG: no theano functions found in items_dict, "
+        logger.info("Possible BUG: no theano functions found in items_dict, "
               "unable to save weights!")
-    print("weight saving complete %s" % save_path)
+    logger.info("weight saving complete %s" % save_path)
 
 
 @coroutine
@@ -4333,10 +4358,10 @@ def save_checkpoint(save_path, pickle_item, use_resource_dir=True):
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
     sys.setrecursionlimit(40000)
-    print("saving checkpoint to %s" % save_path)
+    logger.info("saving checkpoint to %s" % save_path)
     with open(save_path, mode="wb") as f:
         pickle.dump(pickle_item, f, protocol=-1)
-    print("checkpoint saving complete %s" % save_path)
+    logger.info("checkpoint saving complete %s" % save_path)
 
 
 @coroutine
@@ -4365,7 +4390,7 @@ def threaded_checkpoint_writer(maxsize=25):
 
 
 def load_checkpoint(saved_checkpoint_path):
-    print("loading checkpoint from %s" % saved_checkpoint_path)
+    logger.info("loading checkpoint from %s" % saved_checkpoint_path)
     old_recursion_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(40000)
     with open(saved_checkpoint_path, mode="rb") as f:
@@ -4381,7 +4406,7 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
     full_path = os.path.join(partial_path, "master.zip")
     url = "http://github.com/kastnerkyle/simple_template_plotter/archive/master.zip"
     if not os.path.exists(full_path):
-        print("Downloading plotter template code from %s" % url)
+        logger.info("Downloading plotter template code from %s" % url)
         download(url, full_path)
         zip_ref = zipfile.ZipFile(full_path, 'r')
         zip_ref.extractall(partial_path)
@@ -4440,10 +4465,10 @@ def save_results_as_html(save_path, results_dict, use_resource_dir=True,
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    print("saving HTML results %s" % save_path)
+    logger.info("saving HTML results %s" % save_path)
     with open(save_path, "w") as f:
         f.writelines(as_html)
-    print("completed HTML results saving %s" % save_path)
+    logger.info("completed HTML results saving %s" % save_path)
 
 
 @coroutine
@@ -4506,7 +4531,7 @@ def _archive(tag=None):
     else:
         save_script_path = os.path.join(save_path, tag + "_" + get_script_name())
 
-    print("Saving code archive for %s" % (save_path))
+    logger.info("Saving code archive for %s" % (save_path))
     script_location = os.path.abspath(sys.argv[0])
     shutil.copy2(script_location, save_script_path)
 
@@ -4603,6 +4628,8 @@ def run_loop(loop_function, train_function, train_itr,
              skip_n_train_minibatches=-1,
              stateful_object=None):
     """
+    TODO: add all logging info into the js report
+    TODO: add upload fields to add data to an html and save a copy
     loop function should return a list of costs
     stateful_object allows to serialize and relaunch in middle of an epoch
     for long training models
@@ -4706,9 +4733,9 @@ def run_loop(loop_function, train_function, train_itr,
         for e in range(start_epoch, start_epoch + n_epochs):
             joint_start = time.time()
             epoch_start = time.time()
-            print(" ")
-            print("starting training, epoch %i" % e)
-            print(" ")
+            logger.info(" ")
+            logger.info("starting training, epoch %i" % e)
+            logger.info(" ")
             train_mb_count = 0
             valid_mb_count = 0
             results_dict = {k: v for k, v in checkpoint_dict.items()
@@ -4725,7 +4752,7 @@ def run_loop(loop_function, train_function, train_itr,
                     train_costs[train_mb_count] = np.mean(partial_train_costs)
                     tc = train_costs[train_mb_count]
                     if np.isnan(tc):
-                        print("NaN detected in train cost, update %i" % train_mb_count)
+                        logger.info("NaN detected in train cost, update %i" % train_mb_count)
                         raise StopIteration("NaN detected in train")
 
                     train_mb_count += 1
@@ -4739,10 +4766,10 @@ def run_loop(loop_function, train_function, train_itr,
                         copy_dict = pickle.loads(copy_pickle)
                         tcw.send((checkpoint_save_path, copy_dict))
                         tww.send((weights_save_path, copy_dict))
-                        print(" ")
-                        print("update checkpoint after train mb %i" % train_mb_count)
-                        print("current mean cost %f" % np.mean(partial_train_costs))
-                        print(" ")
+                        logger.info(" ")
+                        logger.info("update checkpoint after train mb %i" % train_mb_count)
+                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         tmb = train_costs[:train_mb_count]
                         running_train_mean = np.cumsum(tmb) / (np.arange(train_mb_count) + 1)
@@ -4766,10 +4793,10 @@ def run_loop(loop_function, train_function, train_itr,
                         copy_dict = pickle.loads(copy_pickle)
                         tcw.send((checkpoint_save_path, copy_dict))
                         tww.send((weights_save_path, copy_dict))
-                        print(" ")
-                        print("time checkpoint after train mb %i" % train_mb_count)
-                        print("current mean cost %f" % np.mean(partial_train_costs))
-                        print(" ")
+                        logger.info(" ")
+                        logger.info("time checkpoint after train mb %i" % train_mb_count)
+                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         tmb = train_costs[:train_mb_count]
                         running_train_mean = np.cumsum(tmb) / (np.arange(train_mb_count) + 1)
@@ -4783,24 +4810,22 @@ def run_loop(loop_function, train_function, train_itr,
                             save_checkpoint(object_save_path, stateful_object)
                     draw = random_state.rand()
                     if draw < monitor_prob and not skip_intermediates:
-                        print(" ")
-                        print("starting train mb %i" % train_mb_count)
-                        print("current mean cost %f" % np.mean(partial_train_costs))
-                        print(" ")
+                        logger.info(" ")
+                        logger.info("starting train mb %i" % train_mb_count)
+                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info(" ")
                         results_save_path = "%s_intermediate_results.html" % ident
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         thw.send((results_save_path, this_results_dict))
-                    else:
-                        print(".", end="")
             except StopIteration:
                 # Slice so that only valid data is in the minibatch
                 # this also assumes there is not a variable number
                 # of minibatches in an epoch!
                 train_stop = time.time()
                 train_costs = train_costs[:train_mb_count]
-                print(" ")
-                print("starting validation, epoch %i" % e)
-                print(" ")
+                logger.info(" ")
+                logger.info("starting validation, epoch %i" % e)
+                logger.info(" ")
                 valid_start = time.time()
                 try:
                     while True:
@@ -4808,24 +4833,22 @@ def run_loop(loop_function, train_function, train_itr,
                         valid_costs[valid_mb_count] = np.mean(partial_valid_costs)
                         vc = valid_costs[valid_mb_count]
                         if np.isnan(vc):
-                            print("NaN detected in valid cost, minibatch %i" % valid_mb_count)
+                            logger.info("NaN detected in valid cost, minibatch %i" % valid_mb_count)
                             raise StopIteration("NaN detected in valid")
                         valid_mb_count += 1
                         draw = random_state.rand()
                         if draw < monitor_prob and not skip_intermediates:
-                            print(" ")
-                            print("valid mb %i" % valid_mb_count)
-                            print("current validation mean cost %f" % np.mean(
+                            logger.info(" ")
+                            logger.info("valid mb %i" % valid_mb_count)
+                            logger.info("current validation mean cost %f" % np.mean(
                                 valid_costs))
-                            print(" ")
+                            logger.info(" ")
                             results_save_path = "%s_intermediate_results.html" % ident
                             this_results_dict["this_epoch_valid_auto"] = valid_costs[:valid_mb_count]
                             thw.send((results_save_path, this_results_dict))
-                        else:
-                            print(".", end="")
                 except StopIteration:
                     pass
-                print(" ")
+                logger.info(" ")
                 valid_stop = time.time()
                 epoch_stop = time.time()
                 valid_costs = valid_costs[:valid_mb_count]
@@ -4850,16 +4873,16 @@ def run_loop(loop_function, train_function, train_itr,
                 # np.inf trick to avoid taking the min of length 0 list
                 old_min_train_cost = min(overall_train_costs + [np.inf])
                 if np.isnan(mean_epoch_train_cost):
-                    print("previous train costs %s" % overall_train_costs[-5:])
-                    print("NaN detected in train cost, epoch %i" % e)
+                    logger.info("previous train costs %s" % overall_train_costs[-5:])
+                    logger.info("NaN detected in train cost, epoch %i" % e)
                     raise StopIteration("NaN detected in train")
                 overall_train_costs.append(mean_epoch_train_cost)
 
                 mean_epoch_valid_cost = np.mean(valid_costs)
                 old_min_valid_cost = min(overall_valid_costs + [np.inf])
                 if np.isnan(mean_epoch_valid_cost):
-                    print("previous valid costs %s" % overall_valid_costs[-5:])
-                    print("NaN detected in valid cost, epoch %i" % e)
+                    logger.info("previous valid costs %s" % overall_valid_costs[-5:])
+                    logger.info("NaN detected in valid cost, epoch %i" % e)
                     raise StopIteration("NaN detected in valid")
                 overall_valid_costs.append(mean_epoch_valid_cost)
 
@@ -4892,12 +4915,12 @@ def run_loop(loop_function, train_function, train_itr,
 
                 script = get_script_name()
                 hostname = socket.gethostname()
-                print("host %s, script %s" % (hostname, script))
-                print("epoch %i complete" % e)
-                print("epoch mean train cost %f" % mean_epoch_train_cost)
-                print("epoch mean valid cost %f" % mean_epoch_valid_cost)
-                print("previous train costs %s" % overall_train_costs[-5:])
-                print("previous valid costs %s" % overall_valid_costs[-5:])
+                logger.info("host %s, script %s" % (hostname, script))
+                logger.info("epoch %i complete" % e)
+                logger.info("epoch mean train cost %f" % mean_epoch_train_cost)
+                logger.info("epoch mean valid cost %f" % mean_epoch_valid_cost)
+                logger.info("previous train costs %s" % overall_train_costs[-5:])
+                logger.info("previous valid costs %s" % overall_valid_costs[-5:])
 
                 results_dict = {k: v for k, v in checkpoint_dict.items()
                                 if k not in ignore_keys}
@@ -4907,7 +4930,7 @@ def run_loop(loop_function, train_function, train_itr,
                 if e < checkpoint_delay or skip_minimums:
                     pass
                 elif mean_epoch_valid_cost < old_min_valid_cost:
-                    print("checkpointing valid...")
+                    logger.info("checkpointing valid...")
                     # Using dumps so relationship between keys in the pickle
                     # is preserved
                     best_valid_checkpoint_pickle = pickle.dumps(checkpoint_dict)
@@ -4915,19 +4938,19 @@ def run_loop(loop_function, train_function, train_itr,
                     if mean_epoch_train_cost < old_min_train_cost:
                         best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                         best_train_checkpoint_epoch = e
-                    print("valid checkpointing complete.")
+                    logger.info("valid checkpointing complete.")
                 elif mean_epoch_train_cost < old_min_train_cost:
-                    print("checkpointing train...")
+                    logger.info("checkpointing train...")
                     best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                     best_train_checkpoint_epoch = e
-                    print("train checkpointing complete.")
+                    logger.info("train checkpointing complete.")
 
                 if e < checkpoint_delay:
                     pass
                     # Don't skip force checkpoints after default delay
                     # Printing already happens above
                 elif((e % checkpoint_every_n_epochs) == 0) or (e == (n_epochs - 1)):
-                    print("checkpointing force...")
+                    logger.info("checkpointing force...")
                     checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                     weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                     results_save_path = "%s_model_results_%i.html" % (ident, e)
@@ -4938,7 +4961,7 @@ def run_loop(loop_function, train_function, train_itr,
                     tcw.send((checkpoint_save_path, copy_dict))
                     tww.send((weights_save_path, copy_dict))
                     thw.send((results_save_path, results_dict))
-                    print("force checkpointing complete.")
+                    logger.info("force checkpointing complete.")
 
                 checkpoint_stop = time.time()
                 joint_stop = time.time()
@@ -4961,7 +4984,7 @@ def run_loop(loop_function, train_function, train_itr,
                 overall_joint_deltas.append(joint_time_delta)
                 overall_joint_times.append(joint_time_total)
     except KeyboardInterrupt:
-        print("Training loop interrupted by user! Saving current best results.")
+        logger.info("Training loop interrupted by user! Saving current best results.")
 
     if not skip_minimums:
         # Finalize saving best train and valid
@@ -4986,7 +5009,7 @@ def run_loop(loop_function, train_function, train_itr,
         tcw.send((checkpoint_save_path, best_train_checkpoint_dict))
         tww.send((weights_save_path, best_train_checkpoint_dict))
         thw.send((results_save_path, best_train_results_dict))
-    print("run_loop finished, closing write threads (this may take a while!)")
+    logger.info("run_loop finished, closing write threads (this may take a while!)")
     tcw.close()
     tww.close()
     thw.close()
