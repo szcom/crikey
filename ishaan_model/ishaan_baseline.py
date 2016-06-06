@@ -34,7 +34,7 @@ if __name__ == "__main__":
     n_epochs = 1000  # Used way at the bottom in the training loop!
     checkpoint_every_n_epochs = 1
     checkpoint_every_n_updates = 1000
-    checkpoint_every_n_seconds = 10 # 60 * 60
+    checkpoint_every_n_seconds = 60 * 60
     random_state = np.random.RandomState(1999)
 
     filepath = "/Tmp/kastner/blizzard_wav_files/*flac"
