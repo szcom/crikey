@@ -221,7 +221,7 @@ if __name__ == "__main__":
 
     grads = tensor.grad(cost, params)
     grads = [tensor.clip(g, -1., 1.) for g in grads]
-    learning_rate = 2E-4
+    learning_rate = 1E-3
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
 

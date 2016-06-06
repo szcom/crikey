@@ -67,6 +67,12 @@ ch = logging.StreamHandler(string_f)
 formatter = logging.Formatter('%(message)s')
 ch.setFormatter(formatter)
 logger.addHandler(ch)
+
+
+ch = logging.FileHandler("/u/kastner/src/crikey/ishaan_model/log.log")
+formatter = logging.Formatter('%(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 """
 end logging
 """
@@ -102,7 +108,8 @@ def get_generic_name():
         script_name = filename.split(os.sep)[-1]
         lib_location = os.path.realpath(__file__)
         lib_name = lib_location.split(os.sep)[-1]
-        if script_name != lib_name:
+        # cover .py and .pyc
+        if script_name != lib_name and script_name != lib_name[:-1]:
             name = script_name + "_" + prev_function_name
             #print(frame, filename, line_number, function_name, lines, index)
             return name
@@ -3519,7 +3526,7 @@ def Linear(list_of_inputs, input_dims, output_dim, random_state, name=None,
     """
     if weight_norm is None:
         # Let other classes delegate to default of linear
-        weight_norm = False
+        weight_norm = True
     input_var = tensor.concatenate(list_of_inputs, axis=-1)
     input_dim = sum(input_dims)
     terms = []
@@ -4304,7 +4311,7 @@ def set_shared_variables_in_function(func, list_of_values):
 
 
 def save_weights(save_path, items_dict, use_resource_dir=True):
-    logger.info("not saving weights due to copy issues in npz")
+    logger.info("Not saving weights due to copy issues in npz")
     return
     weights_dict = {}
     # k is the function name, v is a theano function
@@ -4318,13 +4325,13 @@ def save_weights(save_path, items_dict, use_resource_dir=True):
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    logger.info("saving weights to %s" % save_weights_path)
+    logger.info("Saving weights to %s" % save_weights_path)
     if len(weights_dict.keys()) > 0:
         np.savez(save_path, **weights_dict)
     else:
         logger.info("Possible BUG: no theano functions found in items_dict, "
               "unable to save weights!")
-    logger.info("weight saving complete %s" % save_path)
+    logger.info("Weight saving complete %s" % save_path)
 
 
 @coroutine
@@ -4358,10 +4365,10 @@ def save_checkpoint(save_path, pickle_item, use_resource_dir=True):
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
     sys.setrecursionlimit(40000)
-    logger.info("saving checkpoint to %s" % save_path)
+    logger.info("Saving checkpoint to %s" % save_path)
     with open(save_path, mode="wb") as f:
         pickle.dump(pickle_item, f, protocol=-1)
-    logger.info("checkpoint saving complete %s" % save_path)
+    logger.info("Checkpoint saving complete %s" % save_path)
 
 
 @coroutine
@@ -4390,7 +4397,7 @@ def threaded_checkpoint_writer(maxsize=25):
 
 
 def load_checkpoint(saved_checkpoint_path):
-    logger.info("loading checkpoint from %s" % saved_checkpoint_path)
+    logger.info("Loading checkpoint from %s" % saved_checkpoint_path)
     old_recursion_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(40000)
     with open(saved_checkpoint_path, mode="rb") as f:
@@ -4465,10 +4472,10 @@ def save_results_as_html(save_path, results_dict, use_resource_dir=True,
         # Assume it ends with .py ...
         script_name = get_script_name()[:-3]
         save_path = os.path.join(get_resource_dir(script_name), save_path)
-    logger.info("saving HTML results %s" % save_path)
+    logger.info("Saving HTML results %s" % save_path)
     with open(save_path, "w") as f:
         f.writelines(as_html)
-    logger.info("completed HTML results saving %s" % save_path)
+    logger.info("Completed HTML results saving %s" % save_path)
 
 
 @coroutine
@@ -4634,6 +4641,7 @@ def run_loop(loop_function, train_function, train_itr,
     stateful_object allows to serialize and relaunch in middle of an epoch
     for long training models
     """
+    logger.info("Running loop...")
     # Assume keys which are theano functions to ignore!
     ignore_keys = [k for k, v in checkpoint_dict.items()
                    if isinstance(v, theano.compile.function_module.Function)]
@@ -4734,7 +4742,7 @@ def run_loop(loop_function, train_function, train_itr,
             joint_start = time.time()
             epoch_start = time.time()
             logger.info(" ")
-            logger.info("starting training, epoch %i" % e)
+            logger.info("Starting training, epoch %i" % e)
             logger.info(" ")
             train_mb_count = 0
             valid_mb_count = 0
@@ -4767,8 +4775,8 @@ def run_loop(loop_function, train_function, train_itr,
                         tcw.send((checkpoint_save_path, copy_dict))
                         tww.send((weights_save_path, copy_dict))
                         logger.info(" ")
-                        logger.info("update checkpoint after train mb %i" % train_mb_count)
-                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info("Update checkpoint after train mb %i" % train_mb_count)
+                        logger.info("Current mean cost %f" % np.mean(partial_train_costs))
                         logger.info(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         tmb = train_costs[:train_mb_count]
@@ -4794,8 +4802,8 @@ def run_loop(loop_function, train_function, train_itr,
                         tcw.send((checkpoint_save_path, copy_dict))
                         tww.send((weights_save_path, copy_dict))
                         logger.info(" ")
-                        logger.info("time checkpoint after train mb %i" % train_mb_count)
-                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info("Time checkpoint after train mb %i" % train_mb_count)
+                        logger.info("Current mean cost %f" % np.mean(partial_train_costs))
                         logger.info(" ")
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
                         tmb = train_costs[:train_mb_count]
@@ -4811,8 +4819,8 @@ def run_loop(loop_function, train_function, train_itr,
                     draw = random_state.rand()
                     if draw < monitor_prob and not skip_intermediates:
                         logger.info(" ")
-                        logger.info("starting train mb %i" % train_mb_count)
-                        logger.info("current mean cost %f" % np.mean(partial_train_costs))
+                        logger.info("Starting train mb %i" % train_mb_count)
+                        logger.info("Current mean cost %f" % np.mean(partial_train_costs))
                         logger.info(" ")
                         results_save_path = "%s_intermediate_results.html" % ident
                         this_results_dict["this_epoch_train_auto"] = train_costs[:train_mb_count]
@@ -4824,7 +4832,7 @@ def run_loop(loop_function, train_function, train_itr,
                 train_stop = time.time()
                 train_costs = train_costs[:train_mb_count]
                 logger.info(" ")
-                logger.info("starting validation, epoch %i" % e)
+                logger.info("Starting validation, epoch %i" % e)
                 logger.info(" ")
                 valid_start = time.time()
                 try:
@@ -4839,8 +4847,8 @@ def run_loop(loop_function, train_function, train_itr,
                         draw = random_state.rand()
                         if draw < monitor_prob and not skip_intermediates:
                             logger.info(" ")
-                            logger.info("valid mb %i" % valid_mb_count)
-                            logger.info("current validation mean cost %f" % np.mean(
+                            logger.info("Valid mb %i" % valid_mb_count)
+                            logger.info("Current validation mean cost %f" % np.mean(
                                 valid_costs))
                             logger.info(" ")
                             results_save_path = "%s_intermediate_results.html" % ident
@@ -4873,7 +4881,7 @@ def run_loop(loop_function, train_function, train_itr,
                 # np.inf trick to avoid taking the min of length 0 list
                 old_min_train_cost = min(overall_train_costs + [np.inf])
                 if np.isnan(mean_epoch_train_cost):
-                    logger.info("previous train costs %s" % overall_train_costs[-5:])
+                    logger.info("Previous train costs %s" % overall_train_costs[-5:])
                     logger.info("NaN detected in train cost, epoch %i" % e)
                     raise StopIteration("NaN detected in train")
                 overall_train_costs.append(mean_epoch_train_cost)
@@ -4881,7 +4889,7 @@ def run_loop(loop_function, train_function, train_itr,
                 mean_epoch_valid_cost = np.mean(valid_costs)
                 old_min_valid_cost = min(overall_valid_costs + [np.inf])
                 if np.isnan(mean_epoch_valid_cost):
-                    logger.info("previous valid costs %s" % overall_valid_costs[-5:])
+                    logger.info("Previous valid costs %s" % overall_valid_costs[-5:])
                     logger.info("NaN detected in valid cost, epoch %i" % e)
                     raise StopIteration("NaN detected in valid")
                 overall_valid_costs.append(mean_epoch_valid_cost)
@@ -4915,12 +4923,12 @@ def run_loop(loop_function, train_function, train_itr,
 
                 script = get_script_name()
                 hostname = socket.gethostname()
-                logger.info("host %s, script %s" % (hostname, script))
-                logger.info("epoch %i complete" % e)
-                logger.info("epoch mean train cost %f" % mean_epoch_train_cost)
-                logger.info("epoch mean valid cost %f" % mean_epoch_valid_cost)
-                logger.info("previous train costs %s" % overall_train_costs[-5:])
-                logger.info("previous valid costs %s" % overall_valid_costs[-5:])
+                logger.info("Host %s, script %s" % (hostname, script))
+                logger.info("Epoch %i complete" % e)
+                logger.info("Epoch mean train cost %f" % mean_epoch_train_cost)
+                logger.info("Epoch mean valid cost %f" % mean_epoch_valid_cost)
+                logger.info("Previous train costs %s" % overall_train_costs[-5:])
+                logger.info("Previous valid costs %s" % overall_valid_costs[-5:])
 
                 results_dict = {k: v for k, v in checkpoint_dict.items()
                                 if k not in ignore_keys}
@@ -4930,7 +4938,7 @@ def run_loop(loop_function, train_function, train_itr,
                 if e < checkpoint_delay or skip_minimums:
                     pass
                 elif mean_epoch_valid_cost < old_min_valid_cost:
-                    logger.info("checkpointing valid...")
+                    logger.info("Checkpointing valid...")
                     # Using dumps so relationship between keys in the pickle
                     # is preserved
                     best_valid_checkpoint_pickle = pickle.dumps(checkpoint_dict)
@@ -4938,19 +4946,19 @@ def run_loop(loop_function, train_function, train_itr,
                     if mean_epoch_train_cost < old_min_train_cost:
                         best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                         best_train_checkpoint_epoch = e
-                    logger.info("valid checkpointing complete.")
+                    logger.info("Valid checkpointing complete.")
                 elif mean_epoch_train_cost < old_min_train_cost:
-                    logger.info("checkpointing train...")
+                    logger.info("Checkpointing train...")
                     best_train_checkpoint_pickle = pickle.dumps(checkpoint_dict)
                     best_train_checkpoint_epoch = e
-                    logger.info("train checkpointing complete.")
+                    logger.info("Train checkpointing complete.")
 
                 if e < checkpoint_delay:
                     pass
                     # Don't skip force checkpoints after default delay
                     # Printing already happens above
                 elif((e % checkpoint_every_n_epochs) == 0) or (e == (n_epochs - 1)):
-                    logger.info("checkpointing force...")
+                    logger.info("Checkpointing force...")
                     checkpoint_save_path = "%s_model_checkpoint_%i.pkl" % (ident, e)
                     weights_save_path = "%s_model_weights_%i.npz" % (ident, e)
                     results_save_path = "%s_model_results_%i.html" % (ident, e)
@@ -4961,7 +4969,7 @@ def run_loop(loop_function, train_function, train_itr,
                     tcw.send((checkpoint_save_path, copy_dict))
                     tww.send((weights_save_path, copy_dict))
                     thw.send((results_save_path, results_dict))
-                    logger.info("force checkpointing complete.")
+                    logger.info("Force checkpointing complete.")
 
                 checkpoint_stop = time.time()
                 joint_stop = time.time()
@@ -5009,7 +5017,7 @@ def run_loop(loop_function, train_function, train_itr,
         tcw.send((checkpoint_save_path, best_train_checkpoint_dict))
         tww.send((weights_save_path, best_train_checkpoint_dict))
         thw.send((results_save_path, best_train_results_dict))
-    logger.info("run_loop finished, closing write threads (this may take a while!)")
+    logger.info("Loop finished, closing write threads (this may take a while!)")
     tcw.close()
     tww.close()
     thw.close()

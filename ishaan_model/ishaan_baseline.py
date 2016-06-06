@@ -103,7 +103,6 @@ if __name__ == "__main__":
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
 
-        predict_function = checkpoint_dict["predict_function"]
         sample_function = checkpoint_dict["sample_function"]
 
         if args.temperature is None:
@@ -117,7 +116,7 @@ if __name__ == "__main__":
             # 0 is in the middle
             # CANNOT BE 1 timestep - will get floating point exception!
             # 2 may still be buggy because X_sym gets sliced and scan gets mad with 1 timestep usually...
-            init_x = 127 + np_zeros((fixed_steps, minibatch_size, 1)).astype(theano.config.floatX)
+            init_x = 127 + np_zeros((3, minibatch_size, 1)).astype(theano.config.floatX)
             for i in range(fixed_steps):
                 if i % 100 == 0:
                     print("Sampling step %i" % i)
@@ -231,7 +230,7 @@ if __name__ == "__main__":
 
     grads = tensor.grad(cost, params)
     grads = [tensor.clip(g, -1., 1.) for g in grads]
-    learning_rate = 2E-4
+    learning_rate = 1E-3
     opt = adam(params, learning_rate)
     updates = opt.updates(params, grads)
 
@@ -270,7 +269,6 @@ if __name__ == "__main__":
                                            init_h1_i, init_h2_i, init_h3_i],
                                           [out, h1, h2, h3],
                                           on_unused_input="warn")
-        print("Beginning training loop")
         checkpoint_dict = {}
         checkpoint_dict["train_function"] = train_function
         checkpoint_dict["cost_function"] = cost_function
@@ -287,10 +285,12 @@ if __name__ == "__main__":
         n_cuts = len(X_mb) // cut_len + 1
         partial_costs = []
         for n in range(n_cuts):
+            """
             if n % 100 == 0:
                 print("step %i" % n, end="")
             else:
                 print(".", end="")
+            """
             start = n * cut_len
             stop = (n + 1) * cut_len
             if len(X_mb[start:stop]) < cut_len:
