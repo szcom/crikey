@@ -64,13 +64,8 @@ logger = logging.getLogger(__name__)
 
 string_f = StringIO()
 ch = logging.StreamHandler(string_f)
-formatter = logging.Formatter('%(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
-
-ch = logging.FileHandler("/u/kastner/src/crikey/ishaan_model/log.log")
-formatter = logging.Formatter('%(message)s')
+# Automatically put the HTML break characters on there
+formatter = logging.Formatter('%(message)s<br>')
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 """
@@ -4428,6 +4423,8 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
                            if "IMPORTS_SPLIT" in l][0]
     data_split_index = [n for n, l in enumerate(all_template_lines)
                         if "DATA_SPLIT" in l][0]
+    log_split_index = [n for n, l in enumerate(all_template_lines)
+                       if "LOGGING_SPLIT" in l][0]
     first_part = all_template_lines[:imports_split_index]
     imports_part = []
     js_files_path = os.path.join(js_path, "js")
@@ -4440,7 +4437,8 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
                 ["<script>\n"] + f.readlines() + ["</script>\n"])
     post_imports_part = all_template_lines[
         imports_split_index + 1:data_split_index]
-    last_part = all_template_lines[data_split_index + 1:]
+    log_part = all_template_lines[data_split_index + 1:log_split_index]
+    last_part = all_template_lines[log_split_index + 1:]
 
     def gen_js_field_for_key_value(key, values, show=True):
         assert type(values) is list
@@ -4458,7 +4456,13 @@ def filled_js_template_from_results_dict(results_dict, default_show="all"):
                  else gen_js_field_for_key_value(k, results_dict[k], False)
                  for k in sorted(results_dict.keys())]
     all_filled_lines = first_part + imports_part + post_imports_part
-    all_filled_lines = all_filled_lines + data_part + last_part
+    all_filled_lines = all_filled_lines + data_part + log_part
+    # add logging output
+    tmp = copy.copy(string_f)
+    tmp.seek(0)
+    log_output = tmp.readlines()
+    del tmp
+    all_filled_lines = all_filled_lines + log_output + last_part
     return all_filled_lines
 
 

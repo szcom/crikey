@@ -34,7 +34,7 @@ if __name__ == "__main__":
     n_epochs = 1000  # Used way at the bottom in the training loop!
     checkpoint_every_n_epochs = 1
     checkpoint_every_n_updates = 1000
-    checkpoint_every_n_seconds = 60 * 60
+    checkpoint_every_n_seconds = 10 # 60 * 60
     random_state = np.random.RandomState(1999)
 
     filepath = "/Tmp/kastner/blizzard_wav_files/*flac"
@@ -285,12 +285,10 @@ if __name__ == "__main__":
         n_cuts = len(X_mb) // cut_len + 1
         partial_costs = []
         for n in range(n_cuts):
-            """
             if n % 100 == 0:
                 print("step %i" % n, end="")
             else:
                 print(".", end="")
-            """
             start = n * cut_len
             stop = (n + 1) * cut_len
             if len(X_mb[start:stop]) < cut_len:
