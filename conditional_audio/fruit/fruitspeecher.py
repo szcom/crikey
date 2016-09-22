@@ -5,8 +5,8 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from scipy.io import wavfile
 import os
 import sys
-from kdllib import load_checkpoint, dense_to_one_hot, plot_lines_iamondb_example
-from kdllib import fetch_fruitspeech, list_iterator, np_zeros, GRU, GRUFork
+from kdllib import load_checkpoint, dense_to_one_hot
+from kdllib import fetch_fruitspeech, fetch_fruitspeech_spectrogram, list_iterator, np_zeros, GRU_v1, GRUFork_v1
 from kdllib import make_weights, as_shared, adam, gradient_clipping
 from kdllib import get_values_from_function, set_shared_variables_in_function
 from kdllib import save_checkpoint, save_weights, sample_diagonal_gmm
@@ -16,7 +16,7 @@ from kdllib import diagonal_gmm, diagonal_phase_gmm, soundsc
 if __name__ == "__main__":
     import argparse
 
-    speech = fetch_fruitspeech()
+    speech = fetch_fruitspeech_spectrogram()
     X = speech["data"]
     y = speech["target"]
     vocabulary = speech["vocabulary"]
@@ -47,6 +47,7 @@ if __name__ == "__main__":
     att_size = 10
     n_components = 20
     n_out = X_mb.shape[-1]
+    print(X_mb.shape, "X.shape")
     n_chars = vocabulary_size
     # mag and phase each n_out // 2
     # one 2 for mu, sigma , + n_components for coeff
@@ -226,26 +227,26 @@ if __name__ == "__main__":
 
     params = []
 
-    cell1 = GRU(input_dim, n_hid, random_state)
-    cell2 = GRU(n_hid, n_hid, random_state)
-    cell3 = GRU(n_hid, n_hid, random_state)
+    cell1 = GRU_v1(input_dim, n_hid, random_state)
+    cell2 = GRU_v1(n_hid, n_hid, random_state)
+    cell3 = GRU_v1(n_hid, n_hid, random_state)
     params += cell1.get_params()
     params += cell2.get_params()
     params += cell3.get_params()
 
-    v_cell1 = GRU(1, n_v_hid, random_state)
+    v_cell1 = GRU_v1(1, n_v_hid, random_state)
     params += v_cell1.get_params()
 
     # Use GRU classes only to fork 1 inp to 2 inp:gate pairs
-    inp_to_h1 = GRUFork(input_dim, n_hid, random_state)
-    inp_to_h2 = GRUFork(input_dim, n_hid, random_state)
-    inp_to_h3 = GRUFork(input_dim, n_hid, random_state)
-    att_to_h1 = GRUFork(n_chars, n_hid, random_state)
-    att_to_h2 = GRUFork(n_chars, n_hid, random_state)
-    att_to_h3 = GRUFork(n_chars, n_hid, random_state)
-    h1_to_h2 = GRUFork(n_hid, n_hid, random_state)
-    h1_to_h3 = GRUFork(n_hid, n_hid, random_state)
-    h2_to_h3 = GRUFork(n_hid, n_hid, random_state)
+    inp_to_h1 = GRUFork_v1(input_dim, n_hid, random_state)
+    inp_to_h2 = GRUFork_v1(input_dim, n_hid, random_state)
+    inp_to_h3 = GRUFork_v1(input_dim, n_hid, random_state)
+    att_to_h1 = GRUFork_v1(n_chars, n_hid, random_state)
+    att_to_h2 = GRUFork_v1(n_chars, n_hid, random_state)
+    att_to_h3 = GRUFork_v1(n_chars, n_hid, random_state)
+    h1_to_h2 = GRUFork_v1(n_hid, n_hid, random_state)
+    h1_to_h3 = GRUFork_v1(n_hid, n_hid, random_state)
+    h2_to_h3 = GRUFork_v1(n_hid, n_hid, random_state)
 
     params += inp_to_h1.get_params()
     params += inp_to_h2.get_params()
@@ -257,7 +258,7 @@ if __name__ == "__main__":
     params += h1_to_h3.get_params()
     params += h2_to_h3.get_params()
 
-    inp_to_v_h1 = GRUFork(1, n_v_hid, random_state)
+    inp_to_v_h1 = GRUFork_v1(1, n_v_hid, random_state)
     params += inp_to_v_h1.get_params()
 
     h1_to_att_a, h1_to_att_b, h1_to_att_k = make_weights(n_hid, 3 * [att_size],
@@ -343,6 +344,8 @@ if __name__ == "__main__":
         k = n_components
         half = n_out // 2
         outs = outs.reshape((-1, n_density))
+        theano.printing.Print("outs.shape")(outs.shape)
+        print("half", half, "k", k)
         mu = outs[:, 0:half * k].reshape((-1, half, k))
         sigma = outs[:, half * k:2 * half * k].reshape(
             (-1, half, k))

@@ -1721,7 +1721,10 @@ class list_iterator(base_iterator):
                                        total_shape[1]))
                     new_sc = new_sc.astype(sc[0].dtype)
                     for m, sc_i in enumerate(sc):
-                        new_sc[:len(sc_i), m, :] = sc_i
+                        if len(sc[0].shape) == 1:
+                            new_sc[:len(sc_i), m, :] = sc_i.reshape(-1,1)
+                        else:
+                            new_sc[:len(sc_i), m, :] = sc_i
                 sliced_c[n] = new_sc
             else:
                 # Hit this case if all sequences are the same length
@@ -1859,6 +1862,8 @@ def get_dataset_dir(dataset_name):
                        (os.sep)[:-1] + [dataset_name])
 
 
+def dense_to_one_hot(labels_dense, n_classes=10):
+    return numpy_one_hot(labels_dense, n_classes)
 def numpy_one_hot(labels_dense, n_classes=10):
     """Convert class labels from scalars to one-hot vectors."""
     labels_shape = labels_dense.shape
@@ -3639,6 +3644,88 @@ def t_conv_out_size(input_size, filter_size, stride, pad):
     elif pad == 'same':
         output_size = input_size
     return output_size
+
+
+def gru_weights_v1(input_dim, hidden_dim, forward_init="normal", hidden_init="normal", random_state=None):
+    if random_state is None:
+        raise ValueError("Must pass random_state!")
+    shape = (input_dim, hidden_dim)
+    if forward_init == "normal":
+        W = np.hstack([np_normal(shape, random_state),
+                       np_normal(shape, random_state),
+                       np_normal(shape, random_state)])
+    elif forward_init == "fan":
+        W = np.hstack([np_tanh_fan_normal(shape, random_state),
+                       np_tanh_fan_normal(shape, random_state),
+                       np_tanh_fan_normal(shape, random_state)])
+    b = np_zeros((3 * shape[1],))
+
+    if hidden_init == "normal":
+        Wur = np.hstack([np_normal((shape[1], shape[1]), random_state),
+                         np_normal((shape[1], shape[1]), random_state), ])
+        U = np_normal((shape[1], shape[1]), random_state)
+    elif hidden_init == "ortho":
+        Wur = np.hstack([np_ortho((shape[1], shape[1]), random_state),
+                         np_ortho((shape[1], shape[1]), random_state), ])
+        U = np_ortho((shape[1], shape[1]), random_state)
+    return W, b, Wur, U
+
+
+class GRU_v1(object):
+    def __init__(self, input_dim, hidden_dim, random_state=None, hidden_init="ortho"):
+        if random_state is None:
+            raise ValueError("Must pass random_state")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        W, b, Wur, U = gru_weights_v1(input_dim, hidden_dim, hidden_init=hidden_init, random_state=random_state)
+        self.Wur = as_shared(Wur)
+        self.U = as_shared(U)
+        self.shape = (input_dim, hidden_dim)
+
+    def get_params(self):
+        return self.Wur, self.U
+
+    def get_biases(self):
+        raise AttributeError("GRU cell has no biases!")
+
+    def step(self, inp, gate_inp, prev_state):
+        dim = self.shape[1]
+        gates = tensor.nnet.sigmoid(tensor.dot(prev_state, self.Wur) + gate_inp)
+        update = gates[:, :dim]
+        reset = gates[:, dim:]
+        state_reset = prev_state * reset
+        next_state = tensor.tanh(tensor.dot(state_reset, self.U) + inp)
+        next_state = next_state * update + prev_state * (1 - update)
+        return next_state
+
+
+class GRUFork_v1(object):
+    def __init__(self, input_dim, hidden_dim, random_state=None, forward_init="fan"):
+        if random_state is None:
+            raise ValueError("Must pass random_state")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        W, b, Wur, U = gru_weights_v1(input_dim, hidden_dim, forward_init=forward_init, random_state=random_state)
+        self.W = as_shared(W)
+        self.b = as_shared(b)
+        self.shape = (input_dim, hidden_dim)
+
+    def get_params(self):
+        return self.W, self.b
+
+    def get_biases(self):
+        return [self.b]
+
+    def proj(self, inp):
+        dim = self.shape[1]
+        projected = tensor.dot(inp, self.W) + self.b
+        if projected.ndim == 3:
+            d = projected[:, :, :dim]
+            g = projected[:, :, dim:]
+        else:
+            d = projected[:, :dim]
+            g = projected[:, dim:]
+        return d, g
 
 
 def gru_weights(input_dim, hidden_dim, forward_init=None, hidden_init="normal",
