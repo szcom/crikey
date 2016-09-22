@@ -634,12 +634,12 @@ if __name__ == "__main__":
             except StopIteration:
                 pass
             mean_epoch_train_cost = np.mean(train_costs)
+            mean_epoch_valid_cost = np.mean(valid_costs)
+            overall_train_costs.append(mean_epoch_train_cost)
             if np.isnan(overall_train_costs[-1]) or np.isinf(
                 overall_train_costs[-1]):
                 print("Invalid cost detected at epoch %i" % e)
                 raise ValueError("Exiting...")
-            mean_epoch_valid_cost = np.mean(valid_costs)
-            overall_train_costs.append(mean_epoch_train_cost)
             overall_valid_costs.append(mean_epoch_valid_cost)
             checkpoint_dict["overall_train_costs"] = overall_train_costs
             checkpoint_dict["overall_valid_costs"] = overall_valid_costs
